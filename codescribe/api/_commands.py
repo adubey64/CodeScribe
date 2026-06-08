@@ -45,13 +45,19 @@ def inspect(
     query_prompt: str,
     model: Union[Path, str],
     save_prompts: bool = False,
+    verbose: bool = False,
 ) -> None:
     """
     API command for inspecting files
     """
     file_index = {}  # lib.create_file_indexes()
     lib.prompt_inspect(
-        filelist, query_prompt, file_index, model=model, save_prompts=save_prompts
+        filelist,
+        query_prompt,
+        file_index,
+        model=model,
+        save_prompts=save_prompts,
+        verbose=verbose,
     )
 
 
@@ -100,3 +106,47 @@ def format(seed_prompt_list: List[Path]) -> None:
     """
     for seed_prompt in seed_prompt_list:
         lib.format_seed_prompt(seed_prompt)
+
+
+def agent(
+    task: str,
+    model: Union[Path, str],
+    system: str = "",
+    agent_iterations: int = 20,
+    verbose: bool = False,
+    logging: Union[Path, str, None] = None,
+) -> str:
+    """
+    API command for running the agentic loop on a task
+    """
+    return lib.prompt_agent(
+        task,
+        model=model,
+        system=system,
+        agent_iterations=agent_iterations,
+        verbose=verbose,
+        logging=logging,
+    )
+
+
+def loop(
+    task_file: Path,
+    model: Union[Path, str],
+    agent_loops: int = 5,
+    agent_iterations: int = 12,
+    verbose: bool = False,
+    logging: Union[Path, str, None] = None,
+    workdir: Union[Path, None] = None,
+) -> str:
+    """
+    API command for running the bounded loop
+    """
+    return lib.prompt_loop(
+        task_file=task_file,
+        model=model,
+        agent_loops=agent_loops,
+        agent_iterations=agent_iterations,
+        verbose=verbose,
+        logging=logging,
+        workdir=workdir,
+    )

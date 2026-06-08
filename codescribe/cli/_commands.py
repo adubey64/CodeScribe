@@ -229,11 +229,19 @@ def update(
     help="Save file specific prompts to json file",
     mutually_exclusive=["model"],
 )
+@click.option(
+    "--verbose",
+    "-v",
+    "verbose",
+    is_flag=True,
+    help="Print agent diagnostics (per-iteration reasoning and tool calls) to stdout",
+)
 def inspect(
     fortran_files: List[Path],
     query_prompt: str,
     model: Union[str, Path],
     save_prompts: bool,
+    verbose: bool,
 ) -> None:
     """
     \b
@@ -241,8 +249,8 @@ def inspect(
     \b
 
     \b
-    This command applies generative AI to inspect a list of
-    files and answer a query. Results may vary based
+    This command uses the agent in bounded read-only mode to inspect
+    a list of files and answer a query. Results may vary based
     on the the combination of files
     \b
     """
@@ -258,6 +266,7 @@ def inspect(
         query_prompt,
         model,
         save_prompts,
+        verbose=verbose,
     )
 
 
@@ -278,3 +287,180 @@ def format(seed_prompt_list: List[Path]) -> None:
     \b
     """
     api.format([Path(file) for file in seed_prompt_list])
+
+
+@code_scribe.command(name="agent")
+@click.argument("task", required=True)
+@click.option(
+    "--model",
+    "-m",
+    required=True,
+    default=os.getenv("CODESCRIBE_MODEL"),
+    help="Gen AI model name or path",
+)
+@click.option(
+    "--system",
+    "-s",
+    default="",
+    help="Optional system prompt prepended to the agent instructions",
+)
+@click.option(
+    "--agent-iterations",
+    "-niter",
+    default=20,
+    show_default=True,
+    help="Maximum number of tool-call iterations",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    "verbose",
+    is_flag=True,
+    help="Print agent diagnostics (per-iteration reasoning and tool calls) to stdout",
+)
+@click.option(
+    "--log",
+    "log_enabled",
+    is_flag=True,
+    help=(
+        "Write agent diagnostics events (JSONL) to the default path: "
+        ".codescribe/diagnostics/agent.jsonl."
+    ),
+)
+@click.option(
+    "--log-path",
+    "log_path",
+    required=False,
+    default=None,
+    type=click.Path(dir_okay=True, file_okay=True, writable=True),
+    help="Write agent diagnostics events (JSONL) to PATH (implies --log).",
+)
+def agent(
+    task: str,
+    model: Union[str, Path],
+    system: str,
+    agent_iterations: int,
+    verbose: bool,
+    log_enabled: bool,
+    log_path: Union[str, None],
+) -> None:
+    """
+    \b
+    Run an autonomous agent on a task
+    \b
+
+    \b
+    This command drives a generative AI model through an
+    iterative tool-call loop until the task is complete.
+    Available tools: read, bash, edit, write
+    \b
+    """
+    effective_log = None
+    if log_path is not None:
+        effective_log = log_path
+    elif log_enabled:
+        # Empty string means "use default log path" in JsonlDiagnosticsSink.
+        effective_log = ""
+
+    result = api.agent(
+        task,
+        model,
+        system=system,
+        agent_iterations=agent_iterations,
+        verbose=verbose,
+        logging=effective_log,
+    )
+    click.echo(result)
+
+
+@code_scribe.command(name="loop")
+@click.argument("task-file", required=True, type=click.Path(exists=True))
+@click.option(
+    "--model",
+    "-m",
+    required=True,
+    default=os.getenv("CODESCRIBE_MODEL"),
+    help="Gen AI model name or path",
+)
+@click.option(
+    "--agent-loops",
+    "-nloop",
+    default=5,
+    show_default=True,
+    help="Maximum number of bounded agent loops",
+)
+@click.option(
+    "--agent-iterations",
+    "-niter",
+    default=12,
+    show_default=True,
+    help="Maximum tool-call iterations per agent session",
+)
+@click.option(
+    "--workdir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=None,
+    help="Working directory bound for the agent; defaults to the current directory",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    "verbose",
+    is_flag=True,
+    help="Print agent diagnostics (per-iteration reasoning and tool calls) to stdout",
+)
+@click.option(
+    "--log",
+    "log_enabled",
+    is_flag=True,
+    help=(
+        "Write agent diagnostics events (JSONL) to the default path: "
+        ".codescribe/diagnostics/agent.jsonl."
+    ),
+)
+@click.option(
+    "--log-path",
+    "log_path",
+    required=False,
+    default=None,
+    type=click.Path(dir_okay=True, file_okay=True, writable=True),
+    help="Write agent diagnostics events (JSONL) to PATH (implies --log).",
+)
+def loop(
+    task_file: Path,
+    model: Union[str, Path],
+    agent_loops: int,
+    agent_iterations: int,
+    workdir: Union[str, None],
+    verbose: bool,
+    log_enabled: bool,
+    log_path: Union[str, None],
+) -> None:
+    """
+    \b
+    Run a bounded agent loop
+    \b
+
+    \b
+    Each loop runs a fresh agent session that reads the task file,
+    picks the single most important next task, executes it, writes
+    a session report, and exits. State is inferred only from files.
+    \b
+    """
+    effective_log = None
+    if log_path is not None:
+        effective_log = log_path
+    elif log_enabled:
+        # Empty string means "use default log path" in JsonlDiagnosticsSink.
+        effective_log = ""
+
+    result = api.loop(
+        task_file=Path(task_file),
+        model=model,
+        agent_loops=agent_loops,
+        agent_iterations=agent_iterations,
+        verbose=verbose,
+        logging=effective_log,
+        workdir=Path(workdir) if workdir else None,
+    )
+    click.echo(result)

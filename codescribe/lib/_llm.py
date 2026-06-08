@@ -1,17 +1,71 @@
-# Prompt engineering for building diffusion stencils for constant and variable coefficient equations
+import os, importlib, json, requests
 
-# Import libraries
-import re
-import os, sys, importlib, json, requests
-
-from typing import List, Dict, Union
+from typing import Any, List, Dict, Union
 from pathlib import Path
-from alive_progress import alive_bar
-
-from codescribe import lib
 
 
-class OpenAICompModel:
+class _OpenAIBaseModel:
+    outputs = 1
+    max_tokens = 16384
+
+    @property
+    def supports_native_tools(self) -> bool:
+        return True
+
+    def chat(self, chat_template: List[Dict[str, str]]) -> str:
+        response = self.pipeline.chat.completions.create(
+            model=self.model,
+            messages=chat_template,
+            max_tokens=self.max_tokens,
+            n=self.outputs,
+        )
+        self.last_usage = _normalize_openai_usage(getattr(response, "usage", None))
+        return response.choices[0].message.content
+
+    def chat_with_tools(self, chat_template: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        response = self.pipeline.chat.completions.create(
+            model=self.model,
+            messages=chat_template,
+            tools=tools,
+            max_tokens=self.max_tokens,
+            n=self.outputs,
+        )
+        self.last_usage = _normalize_openai_usage(getattr(response, "usage", None))
+        return _normalize_openai_tool_response(response.choices[0].message, self.last_usage)
+
+    def format_tool_result_messages(self, tool_calls: List[Dict[str, Any]], outputs: List[str]) -> List[Dict[str, Any]]:
+        assistant_tool_calls = []
+        for call in tool_calls:
+            assistant_tool_calls.append(
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                    },
+                }
+            )
+
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": assistant_tool_calls,
+            }
+        ]
+        for call, output in zip(tool_calls, outputs):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": output,
+                }
+            )
+        return messages
+
+
+class OpenAICompModel(_OpenAIBaseModel):
     def __init__(self, model: str) -> None:
         openai = importlib.import_module("openai")
 
@@ -23,60 +77,30 @@ class OpenAICompModel:
         if not self.provider:
             raise ValueError("OPENAI_COMP_PROVIDER environment variable is not set")
 
-        if model.lower() == "env":
-            self.model = os.getenv("OPENAI_COMP_MODEL")
-        else:
-            self.model = model
-
-        if os.getenv("OPENAI_COMP_APIKEY"):
-            self.apikey = os.getenv("OPENAI_COMP_APIKEY")
-
-        elif "alcf" in self.provider:
-            self.apikey = os.getenv("ALCF_INFERENCE_APIKEY")
-            if not self.apikey:
-                raise ValueError(
-                    "ALCF_INFERENCE_APIKEY environment variable is not set"
-                )
-        else:
-            self.apikey = "null"
-
-        self.pipeline = openai.OpenAI(api_key=self.apikey, base_url=self.baseurl)
-        self.outputs = 1
-        self.max_tokens = 4096
-
-    def chat(self, chat_template: List[Dict[str, str]]) -> str:
-        response = self.pipeline.chat.completions.create(
-            model=self.model,
-            messages=chat_template,
-            max_tokens=self.max_tokens,
-            n=self.outputs,
-        )
-
-        return response.choices[0].message.content
-
-
-class OpenAIModel:
-    def __init__(self, model: str) -> None:
-        openai = importlib.import_module("openai")
-        self.pipeline = openai.OpenAI()
-        self.outputs = 1
-        self.max_tokens = 4096
         self.model = model
 
-    def chat(self, chat_template: List[Dict[str, str]]) -> str:
-        # We use the Chat Completion endpoint for chat-like inputs
-        response = self.pipeline.chat.completions.create(
-            # Model used here is ChatGPT
-            # You can use all these models for this endpoint:
-            # gpt-4, gpt-4-0314, gpt-4-32k, gpt-4-32k-0314,
-            # gpt-3.5-turbo, gpt-3.5-turbo-0301, gpt-4o
-            model=self.model,
-            messages=chat_template,
-            max_tokens=self.max_tokens,
-            n=self.outputs,
-        )
+        self.apikey = os.getenv("OPENAI_COMP_APIKEY")
+        if not self.apikey:
+            raise ValueError("OPENAI_COMP_APIKEY environment variable is not set")
 
-        return response.choices[0].message.content
+        self.pipeline = openai.OpenAI(api_key=self.apikey, base_url=self.baseurl)
+        self.last_usage = None
+
+    def __repr__(self) -> str:
+        return f"OpenAICompModel(model='{self.model}')"
+
+
+class OpenAIModel(_OpenAIBaseModel):
+    def __init__(self, model: str) -> None:
+        openai = importlib.import_module("openai")
+
+        self.apikey = os.getenv("OPENAI_API_KEY")
+        if not self.apikey:
+            raise ValueError("OPENAI_API_KEY environment variable is not set")
+
+        self.pipeline = openai.OpenAI(api_key=self.apikey)
+        self.model = model
+        self.last_usage = None
 
     def __repr__(self) -> str:
         return f"OpenAIModel(model='{self.model}', outputs={self.outputs}, max_tokens={self.max_tokens})"
@@ -95,7 +119,12 @@ class ArgoModel:
 
         self.model = model
 
+    @property
+    def supports_native_tools(self) -> bool:
+        return False
+
     def chat(self, chat_template: List[Dict[str, str]]) -> str:
+        chat_template = list(chat_template)  # don't mutate caller's list
 
         if chat_template[0]["role"] == "system":
             system_prompt = chat_template[0]["content"]
@@ -103,13 +132,11 @@ class ArgoModel:
         else:
             system_prompt = "You are a large language model named Argo."
 
-        # Combine all role/content pairs into a single text block
         prompt_text = "\n\n".join(
             f"{item['role'].capitalize()}: {item['content'].strip()}"
             for item in chat_template
         )
 
-        # Data to be sent as a POST in JSON format
         data = {
             "user": self.user,
             "model": self.model,
@@ -117,7 +144,6 @@ class ArgoModel:
             "prompt": [prompt_text],
             "stop": [],
             "temperature": 0.1,
-            #"top_p": 0.9,
         }
 
         response = requests.post(
@@ -132,153 +158,112 @@ class ArgoModel:
         return f"ArgoModel(model='{self.model}', api_endpoint='***', user='***')"
 
 
-class KimiModel:
-    """
-    Client for a locally hosted OpenAI-compatible Chat Completions API.
+class AnthropicModel:
+    def __init__(self, model: str) -> None:
+        anthropic = importlib.import_module("anthropic")
 
-    Expects the API key in the environment variable: KIMI_API_KEY
-    Expects the API endpoint in the environment variable: KIMI_API_ENDPOINT
+        self.apikey = os.getenv("ANTHROPIC_API_KEY")
+        if not self.apikey:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
 
-    Default model:
-      moonshotai/Kimi-K2-Instruct
-    """
+        self.base_url = os.getenv("ANTHROPIC_BASE_URL")
+        client_kwargs = {"api_key": self.apikey}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
 
-    def __init__(self) -> None:
-        self.api_key = os.getenv("KIMI_API_KEY")
-        if not self.api_key:
-            raise ValueError("KIMI_API_KEY environment variable is not set")
+        self.client = anthropic.Anthropic(**client_kwargs)
+        self.model = model
+        self.max_tokens = 16384
+        self.last_usage = None
 
-        self.endpoint = os.getenv("KIMI_API_ENDPOINT")
-        if not self.endpoint:
-            raise ValueError("KIMI_API_ENDPOINT environment variable is not set")
-
-        self.model = "moonshotai/Kimi-K2-Instruct"
-        self.outputs = 1
-        self.max_tokens = 4096
-        self.timeout = 120
-
-        self._session = requests.Session()
-        self._headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+    @property
+    def supports_native_tools(self) -> bool:
+        return True
 
     def chat(self, chat_template: List[Dict[str, str]]) -> str:
-        """
-        Send messages to the chat completion endpoint.
+        system = None
+        messages = []
+        for msg in chat_template:
+            if msg["role"] == "system":
+                system = msg["content"]
+            else:
+                messages.append({"role": msg["role"], "content": msg["content"]})
 
-        Parameters
-        ----------
-        chat_template : list[dict]
-            OpenAI-style messages, e.g.:
-            [
-              {"role": "system", "content": "You are helpful."},
-              {"role": "user", "content": "Hello!"}
-            ]
-
-        Returns
-        -------
-        str
-            The assistant's reply (first choice).
-        """
-        payload = {
+        kwargs = {
             "model": self.model,
-            "messages": chat_template,
             "max_tokens": self.max_tokens,
-            "n": self.outputs,
+            "messages": messages,
         }
+        if system:
+            kwargs["system"] = system
 
-        resp = self._session.post(
-            self.endpoint, headers=self._headers, json=payload, timeout=self.timeout
-        )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}") from e
+        response = self.client.messages.create(**kwargs)
+        self.last_usage = _normalize_anthropic_usage(getattr(response, "usage", None))
 
-        data = resp.json()
+        for block in response.content:
+            if block.type == "text":
+                return block.text
+        return ""
 
-        try:
-            return data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError) as e:
-            raise RuntimeError(f"Unexpected response format: {data}") from e
+    def chat_with_tools(self, chat_template: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        system = None
+        messages = []
+        for msg in chat_template:
+            if msg["role"] == "system":
+                system = msg["content"]
+            else:
+                messages.append(msg)
+
+        kwargs = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            "tools": [_openai_tool_to_anthropic_tool(tool) for tool in tools],
+        }
+        if system:
+            kwargs["system"] = system
+
+        response = self.client.messages.create(**kwargs)
+        usage = _normalize_anthropic_usage(getattr(response, "usage", None))
+        self.last_usage = usage
+        return _normalize_anthropic_tool_response(response, usage)
+
+    def format_tool_result_messages(self, tool_calls: List[Dict[str, Any]], outputs: List[str]) -> List[Dict[str, Any]]:
+        assistant_content = []
+        for call in tool_calls:
+            assistant_content.append(
+                {
+                    "type": "tool_use",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "input": call["arguments"],
+                }
+            )
+
+        user_content = []
+        for call, output in zip(tool_calls, outputs):
+            user_content.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call["id"],
+                    "content": output,
+                }
+            )
+
+        return [
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": user_content},
+        ]
 
     def __repr__(self) -> str:
-        return f"KimiModel(model='{self.model}', endpoint='***', outputs={self.outputs}, max_tokens={self.max_tokens})"
+        return f"AnthropicModel(model='{self.model}')"
 
 
-class QwenModel:
-    """
-    Client for a locally hosted OpenAI-compatible Chat Completions API.
+# ---------------------------------------------------------------------------
+# Public model typing / allowlist (used by Agent to reject arbitrary objects)
+# ---------------------------------------------------------------------------
 
-    Expects the API key in the environment variable: KIMI_API_KEY
-    Default endpoint:
-      http://llm.ai.r-ccs.riken.jp:11434/kimi/v1/chat/completions
-    Default model:
-      moonshotai/Kimi-K2-Instruct
-    """
-
-    def __init__(self) -> None:
-        self.api_key = os.getenv("KIMI_API_KEY")
-        if not self.api_key:
-            raise ValueError("KIMI_API_KEY environment variable is not set")
-
-        self.endpoint = os.getenv("KIMI_API_ENDPOINT")
-        if not self.endpoint:
-            raise ValueError("KIMI_API_ENDPOINT environment variable is not set")
-
-        self.model = "qwen3-coder:30b"
-        self.outputs = 1
-        self.max_tokens = 4096
-        self.timeout = 120
-
-        self._session = requests.Session()
-        self._headers = {
-            "Content-Type": "application/json",
-        }
-
-    def chat(self, chat_template: List[Dict[str, str]]) -> str:
-        """
-        Send messages to the chat completion endpoint.
-
-        Parameters
-        ----------
-        chat_template : list[dict]
-            OpenAI-style messages, e.g.:
-            [
-              {"role": "system", "content": "You are helpful."},
-              {"role": "user", "content": "Hello!"}
-            ]
-
-        Returns
-        -------
-        str
-            The assistant's reply (first choice).
-        """
-        payload = {
-            "model": self.model,
-            "messages": chat_template,
-            "max_tokens": self.max_tokens,
-            "n": self.outputs,
-        }
-
-        resp = self._session.post(
-            self.endpoint, headers=self._headers, json=payload, timeout=self.timeout
-        )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}") from e
-
-        data = resp.json()
-
-        try:
-            return data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError) as e:
-            raise RuntimeError(f"Unexpected response format: {data}") from e
-
-    def __repr__(self) -> str:
-        return f"QwenModel(model='{self.model}', endpoint='***', outputs={self.outputs}, max_tokens={self.max_tokens})"
+Model = Union["OpenAIModel", "OpenAICompModel", "AnthropicModel", "ArgoModel", "TFModel"]
 
 
 class TFModel:
@@ -291,13 +276,16 @@ class TFModel:
         self.pipeline = transformers.pipeline(
             "text-generation",
             model=checkpoint_dir,
-            # torch_dtype=torch.float16,
             device=-1,
         )
 
         self.max_new_tokens = 4096
         self.batch_size = 8
         self.max_length = None
+
+    @property
+    def supports_native_tools(self) -> bool:
+        return False
 
     def chat(self, chat_template: List[Dict[str, str]]) -> str:
 
@@ -308,9 +296,6 @@ class TFModel:
             max_new_tokens=self.max_new_tokens,
             max_length=self.max_length,
             batch_size=self.batch_size,
-            # temperature=temperature,
-            # top_p=top_p,
-            # do_sample=True,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=50256,
         )
@@ -321,422 +306,140 @@ class TFModel:
         return f"TFModel(model={self.config.model_type}, max_new_tokens={self.max_new_tokens}, batch_size={self.batch_size}, max_length={self.max_length})"
 
 
+ALLOWED_MODEL_TYPES = (
+    OpenAIModel,
+    OpenAICompModel,
+    AnthropicModel,
+    ArgoModel,
+    TFModel,
+)
+
+
+def _normalize_openai_tool_response(message: Any, usage: Any = None) -> Dict[str, Any]:
+    text = message.content or ""
+    tool_calls = []
+    for call in getattr(message, "tool_calls", []) or []:
+        raw_args = call.function.arguments or "{}"
+        try:
+            arguments = json.loads(raw_args)
+        except json.JSONDecodeError:
+            arguments = {}
+        tool_calls.append(
+            {
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": arguments,
+            }
+        )
+    return {"text": text, "tool_calls": tool_calls, "usage": _normalize_openai_usage(usage)}
+
+
+def _normalize_openai_usage(usage: Any) -> Any:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+
+    normalized = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+    ):
+        value = getattr(usage, key, None)
+        if value is not None:
+            normalized[key] = value
+
+    if not normalized and hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if not normalized and hasattr(usage, "dict"):
+        return usage.dict()
+    return normalized or None
+
+
+def _openai_tool_to_anthropic_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    fn = tool["function"]
+    return {
+        "name": fn["name"],
+        "description": fn.get("description", ""),
+        "input_schema": fn["parameters"],
+    }
+
+
+def _normalize_anthropic_usage(usage: Any) -> Any:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+
+    normalized = {}
+    for src, dst in (
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+        ("cache_read_input_tokens", "cache_read_input_tokens"),
+    ):
+        value = getattr(usage, src, None)
+        if value is not None:
+            normalized[dst] = value
+
+    if not normalized and hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if not normalized and hasattr(usage, "dict"):
+        return usage.dict()
+    return normalized or None
+
+
+def _normalize_anthropic_tool_response(response: Any, usage: Any = None) -> Dict[str, Any]:
+    texts = []
+    tool_calls = []
+    for block in response.content:
+        if block.type == "text":
+            texts.append(block.text)
+        elif block.type == "tool_use":
+            tool_calls.append(
+                {
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": dict(block.input or {}),
+                }
+            )
+    return {
+        "text": "\n".join(t for t in texts if t).strip(),
+        "tool_calls": tool_calls,
+        "usage": usage,
+    }
+
+
 def _merge_system_with_user(
     chat_template: List[Dict[str, str]]
 ) -> List[Dict[str, str]]:
+    """Return a new chat template with system content prepended to the first user message.
+
+    This function does not mutate the caller's message dicts.
     """
-    Remove the system role and prepend its contents to the first
-    user role.
-    """
-    if chat_template and chat_template[0]["role"] == "system":
-        system_content = chat_template[0]["content"]
-        # Find the first user entry
-        for msg in chat_template:
-            if msg["role"] == "user":
-                msg["content"] = system_content + "\n\n" + msg["content"]
-                break
-        # Remove the system entry
-        chat_template = [msg for msg in chat_template if msg["role"] != "system"]
 
-    return chat_template
+    if not chat_template:
+        return []
 
+    # Work on copies to avoid mutating caller-owned dicts.
+    copied = [dict(m) for m in chat_template]
 
-def _set_neural_model(model: Union[Path, str]) -> object:
-    """
-    Set the neural model based on options.
-    """
-    if os.path.exists(model):
-        neural_model = TFModel(model)
+    if copied[0].get("role") != "system":
+        return copied
 
-    elif model.lower().startswith("oaic-"):
-        neural_model = OpenAICompModel(model.lower().strip("oaic")[1:])
+    system_content = copied[0].get("content", "")
+    out: List[Dict[str, str]] = []
+    system_applied = False
 
-    elif model.lower().startswith("openai-"):
-        neural_model = OpenAIModel(model.lower().strip("openai")[1:])
+    for msg in copied[1:]:
+        if (not system_applied) and msg.get("role") == "user":
+            msg["content"] = (system_content + "\n\n" + (msg.get("content") or "")).rstrip()
+            system_applied = True
+        out.append(msg)
 
-    elif model.lower().startswith("argo-"):
-        neural_model = ArgoModel(model.lower().strip("argo")[1:])
-
-    elif model.lower() == "kimi":
-        neural_model = KimiModel()
-
-    elif model.lower() == "qwen":
-        neural_model = QwenModel()
-
-    else:
-        raise ValueError(f"{model} is not available")
-
-    return neural_model
-
-
-def prompt_translate(
-    mapping: List[str],
-    seed_prompt: Path,
-    model: Union[Path, str] = None,
-    save_prompts: bool = False,
-) -> None:
-    """
-    Perform translation using prompts and the supplied model.
-    """
-    neural_model = None
-
-    if model:
-        print("Starting neural conversion process")
-        neural_model = _set_neural_model(model)
-
-    if save_prompts:
-        print("Saving custom prompts per file")
-
-    chat_template = lib.load_chat_template(seed_prompt)
-
-    with alive_bar(len(mapping[0]), bar="blocks") as bar:
-
-        for fsource, csource, finterface, cdraft, promptfile, cheader in zip(
-            mapping[0], mapping[1], mapping[2], mapping[3], mapping[4], mapping[5]
-        ):
-
-            bar.text(fsource)
-            bar()
-
-            if not os.path.isfile(csource) or save_prompts:
-                cached_prompt = chat_template[-1]["content"]
-
-                with open(fsource, "r") as sfile:
-                    is_comment = False
-                    source_code = []
-
-                    for line in sfile.readlines():
-                        is_comment = False
-
-                        if line.strip().lower().startswith(("c", "!!", "!")) and (
-                            not line.strip().lower().startswith(("complex"))
-                        ):
-                            is_comment = True
-
-                        if not is_comment:
-                            source_code.append(line)
-
-                    if source_code:
-                        chat_template[-1]["content"] += (
-                            "\n" + "<source>\n" + "".join(source_code) + "</source>"
-                        )
-
-                if os.path.isfile(cdraft):
-
-                    draft_code = []
-                    with open(cdraft) as dfile:
-                        for line in dfile.readlines():
-                            draft_code.append(line)
-
-                        if draft_code:
-                            chat_template[-1]["content"] += (
-                                "\n\n" + "<draft>\n" + "".join(draft_code) + "</draft>"
-                            )
-
-                if save_prompts:
-                    with open(promptfile, "w") as pdest:
-                        json.dump(chat_template, pdest, indent=4)
-                    print(f"Generated prompt file for LLM consumption {promptfile}")
-
-                if neural_model:
-                    result = neural_model.chat(chat_template)
-
-                    with open(csource, "w") as cdest, open(
-                        finterface, "w"
-                    ) as fdest, open(cheader, "w") as chead:
-
-                        cheader = re.search(
-                            r"<cheader>(.*?)</cheader>", result, re.DOTALL
-                        )
-                        csource = re.search(
-                            r"<csource>(.*?)</csource>", result, re.DOTALL
-                        )
-                        fsource = re.search(
-                            r"<fsource>(.*?)</fsource>", result, re.DOTALL
-                        )
-
-                        if csource:
-                            cdest.write(csource.group(1))
-                        else:
-                            cdest.write(result)
-
-                        if cheader:
-                            chead.write(cheader.group(1))
-                        else:
-                            chead.write(result)
-
-                        if fsource:
-                            fdest.write(fsource.group(1))
-
-                lib.create_archive_file(
-                    chat_template + [{"role": "assistant", "content": result}],
-                    neural_model,
-                )
-
-                chat_template[-1]["content"] = cached_prompt
-
-            else:
-                continue
-
-
-def prompt_inspect(
-    filelist: List[Path],
-    query_prompt: str,
-    file_index: Dict[str, str] = {},
-    model: Union[Path, str] = None,
-    save_prompts: bool = False,
-) -> None:
-    """
-    Perform inspection on a list of files using a query prompt.
-    """
-    neural_model = None
-
-    if model:
-        print("Performing neural inspection")
-        neural_model = _set_neural_model(model)
-
-    if save_prompts:
-        print("Saving prompts to scribe.json")
-
-    chat_template = [{"role": "system", "content": ""}]
-
-    chat_template[-1]["content"] += (
-        "You are a coding assistant.\n"
-        + "The user will provide source code from a set of files that\n"
-        + "belong to a scientific computing codebase. Understand the\n"
-        + "source code and answer a query that follows.\n"
-        + "Source code for each file will be separated using\n"
-        + "elements <filename> ... </filename>. Additional\n"
-        + "information related to the project structure may also be\n"
-        + "provided within <index> ... </index>. This information will\n"
-        + "contain an index of subroutines, functions, and modules contained\n"
-        + "in each file. Note that you will find subroutines and functions\n"
-        + "repeated along nodes in the directory tree. This may be due to a directory-based\n"
-        + "inheritance design implemented by the project. If the index element is not\n"
-        + "present, then you may ignore it. The query prompt will be provided at the end\n"
-        + "using elements <query> ... </query>.\n\n"
-    )
-
-    chat_template.append({"role": "user", "content": ""})
-
-    filtered_file_index = {}
-    for fsource in filelist:
-
-        if file_index:
-            filtered_file_index.update(lib.filter_file_indexes(fsource, file_index))
-
-        with open(fsource, "r") as sfile:
-            source_code = []
-
-            for line in sfile.readlines():
-                source_code.append(line)
-
-        if source_code:
-            chat_template[-1]["content"] += (
-                "\n" + f"<{fsource}>\n" + "".join(source_code) + f"</{fsource}>\n"
-            )
-
-    if filtered_file_index:
-        chat_template[-1]["content"] += "<index>\n"
-        for construct, file_path in filtered_file_index.items():
-            chat_template[-1]["content"] += f"{construct}: {file_path}\n"
-        chat_template[-1]["content"] += "</index>\n\n"
-
-    chat_template[-1]["content"] += "\n" + f"<query>\n" + query_prompt + f"\n</query>\n"
-
-    if save_prompts:
-        with open("scribe.json", "w") as pdest:
-            json.dump(chat_template, pdest, indent=4)
-
-    if neural_model:
-        result = neural_model.chat(chat_template)
-        print(result)
-
-
-def prompt_generate(
-    seed_prompt: Union[Path, str],
-    model: Union[Path, str] = None,
-    save_prompts: bool = False,
-    reference_existing: List[Path] = [],
-) -> None:
-    """
-    Perform code generation based on the provided seed prompt.
-    """
-    neural_model = None
-
-    if model:
-        print("Performing neural generation")
-        neural_model = _set_neural_model(model)
-
-    if save_prompts:
-        print("Saving prompts to scribe.json")
-
-    system_template = [{"role": "system", "content": ""}]
-    system_template[-1]["content"] += (
-        "You are a code generation and editing assistant.\n"
-        + "When the user asks for code that spans multiple files,\n"
-        + "output each file enclosed within\n"
-        + "XML-style tags using the format:\n"
-        + "\n"
-        + "<filename1>\n"
-        + "... file contents ...\n"
-        + "</filename1>\n"
-        + "\n"
-        + "<filename2>\n"
-        + "... file contents ...\n"
-        + "</filename2>\n"
-        + "\n"
-        + "Do not add any explanations or commentary outside of these tags.\n"
-        + "Note that some of these files may be requested to be treated as read-only.\n"
-        + "Do not edit or generate files that are requested as read-only."
-    )
-
-    if os.path.exists(seed_prompt):
-        chat_template = system_template + lib.load_chat_template(seed_prompt)
-    elif isinstance(seed_prompt, str):
-        chat_template = system_template + [{"role": "user", "content": seed_prompt}]
-    else:
-        raise ValueError(f"Cannot handle seed_prompt")
-
-    if reference_existing:
-        chat_template[-1]["content"] += (
-            "\n\nUse the content of the following files as a reference to \n"
-            + "update the files above. Do not edit the files below; treat them as read-only.\n\n"
-        )
-
-        for filename in reference_existing:
-            with open(filename, "r") as sfile:
-                source_code = []
-
-                for line in sfile.readlines():
-                    source_code.append(line)
-
-            if source_code:
-                chat_template[-1]["content"] += (
-                    "\n" + f"<{filename}>\n" + "".join(source_code) + f"</{filename}>\n"
-                )
-
-    if save_prompts:
-        with open("scribe.json", "w") as pdest:
-            json.dump(chat_template, pdest, indent=4)
-
-    if neural_model:
-        result = neural_model.chat(chat_template)
-
-        pattern = re.compile(r"<([^>]+)>\s*(.*?)\s*</\1>", re.DOTALL)
-
-        for match in pattern.finditer(result):
-            filename, content = match.groups()
-            # Ensure directory exists if filename has subpaths
-            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-            # Write to file
-            with open(filename, "w") as f:
-                f.write(content.strip() + "\n")
-            print(f"Wrote {filename}")
-
-        lib.create_archive_file(
-            chat_template + [{"role": "assistant", "content": result}], neural_model
-        )
-
-
-def prompt_update(
-    filelist: List[Path],
-    seed_prompt: Path,
-    query_prompt: str,
-    model: Union[Path, str] = None,
-    reference_existing: List[Path] = [],
-):
-    """
-    Perform code updates based on the provided seed prompt and file list.
-    """
-    neural_model = None
-
-    print("Performing neural update")
-    neural_model = _set_neural_model(model)
-
-    system_template = [{"role": "system", "content": ""}]
-    system_template[-1]["content"] += (
-        "You are a code generation and editing assistant.\n"
-        + "When the user asks for code that spans multiple files,\n"
-        + "output each file enclosed within\n"
-        + "XML-style tags using the format:\n"
-        + "\n"
-        + "<filename1>\n"
-        + "... file contents ...\n"
-        + "</filename1>\n"
-        + "\n"
-        + "<filename2>\n"
-        + "... file contents ...\n"
-        + "</filename2>\n"
-        + "\n"
-        + "Do not add any explanations or commentary outside of these tags.\n"
-        + "Note that some of these files may be requested to be treated as \n"
-        + "read-only or may not be appended.\n"
-        + "Do not edit files if they are not appended or requested as read-only."
-    )
-
-    if seed_prompt:
-        chat_template = system_template + lib.load_chat_template(seed_prompt)
-    else:
-        chat_template = system_template + [{"role": "user", "content": ""}]
-
-    if query_prompt:
-        chat_template[-1]["content"] += query_prompt
-
-    if set(filelist) & set(reference_existing):
-        raise ValueError("Reference and target files should be mutually exclusive")
-
-    if filelist:
-        chat_template[-1]["content"] += (
-            "\n\nUpdate the content of the following files based on\n"
-            + "the instructions. Enclose the output of each file in their\n"
-            + "respective XML elements. Only update the following files.\n\n"
-        )
-
-        for filename in filelist:
-            with open(filename, "r") as sfile:
-                source_code = []
-
-                for line in sfile.readlines():
-                    source_code.append(line)
-
-            if source_code:
-                chat_template[-1]["content"] += (
-                    "\n" + f"<{filename}>\n" + "".join(source_code) + f"</{filename}>\n"
-                )
-
-    if reference_existing:
-        chat_template[-1]["content"] += (
-            "Use the content of the following files as a reference to \n"
-            + "update the files above. Do not edit the files below; treat them as read-only.\n\n"
-        )
-
-        for filename in reference_existing:
-            with open(filename, "r") as sfile:
-                source_code = []
-
-                for line in sfile.readlines():
-                    source_code.append(line)
-
-            if source_code:
-                chat_template[-1]["content"] += (
-                    "\n" + f"<{filename}>\n" + "".join(source_code) + f"</{filename}>\n"
-                )
-
-    if neural_model:
-        result = neural_model.chat(chat_template)
-
-        pattern = re.compile(r"<([^>]+)>\s*(.*?)\s*</\1>", re.DOTALL)
-
-        for match in pattern.finditer(result):
-            filename, content = match.groups()
-            # Ensure directory exists if filename has subpaths
-            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-            # Write to file
-            with open(filename, "w") as f:
-                f.write(content.strip() + "\n")
-            print(f"Wrote {filename}")
-
-        lib.create_archive_file(
-            chat_template + [{"role": "assistant", "content": result}], neural_model
-        )
+    # If there was a system message but no user message, just drop the system.
+    return out
