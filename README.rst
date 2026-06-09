@@ -57,8 +57,8 @@ code-generation and maintenance tasks.
 -  Custom Prompts: Automatically generate prompts for generative AI to
    assist with the conversion process.
 
--  Language Model Integration: Use OpenAI, Anthropic,
-   OpenAI-compatible endpoints (recommended), or local Transformers checkpoints.
+-  Language Model Integration: Use OpenAI, Anthropic, ARGO,
+   OpenAI-compatible endpoints, or local Transformers checkpoints.
 
    |fig2|
 
@@ -69,14 +69,10 @@ code-generation and maintenance tasks.
    existing ones from natural-language prompts.
 
 -  Agentic Coding: Run iterative tool-using agents with ``read``,
-   ``bash``, ``edit``, and ``write`` tools.
+   ``glob``, ``bash``, ``edit``, and ``write`` tools.
 
 -  Bounded Project Loops: Run repeated, fresh-session coding loops over
    a task file while constraining tool access to the working tree.
-
--  Agent Internals Documentation: See ``docs/agent.md`` for a concise,
-   first-principles explanation of the architecture and design of
-   ``codescribe/lib/_agent.py``.
 
 *******************
  Statement of Need
@@ -196,7 +192,7 @@ Following is a brief overview of different commands:
       # Example contents of seed_prompt.toml
 
       [[chat.user]]
-      content = "‹Rules and syntax-related instructions for code conversion>"
+      content = "<Rules and syntax-related instructions for code conversion>"
 
       [[chat.assistant]]
       content = "I am ready. Please give me a test problem."
@@ -243,32 +239,54 @@ Following is a brief overview of different commands:
    files as read-only references.
 
 #. ``code-scribe agent "<task>" -m <model_name_or_path>``: Run a
-   standalone coding agent that can iteratively use ``read``, ``bash``,
-   ``edit``, and ``write`` tools until it reaches a final answer. When a
-   backend supports native tool calling, Codescribe uses that directly;
-   otherwise it falls back to a text protocol using ``<tool_call>`` and
-   ``<final_answer>`` blocks.
+   standalone coding agent that can iteratively use ``read``, ``glob``,
+   ``bash``, ``edit``, and ``write`` tools until it reaches a final
+   answer. When a backend supports native tool calling, Codescribe uses
+   that directly; otherwise it falls back to a text protocol using
+   ``<tool_call>`` and ``<final_answer>`` blocks.
+
+   Key flags:
+
+   -  ``--verbose`` / ``-v``: stream per-iteration token usage and tool
+      calls to stdout.
+   -  ``--log`` / ``--log-path PATH``: write TOML diagnostics to disk.
 
 #. ``code-scribe loop <task_file> -m <model_name_or_path>``: Run a
-   bounded loop in which each session starts fresh, reads the task
-   file, performs exactly one important pending task, writes a concise
-   report, and exits. Loop status is written under
+   repeated bounded loop in which each session starts fresh, reads the
+   task file, performs exactly one important pending task, writes a
+   concise report, and exits. Loop status is written under
    ``.codescribe/loop/``.
+
+   Key flags:
+
+   -  ``--workdir DIR``: root directory the agent is bounded to.
+   -  ``--agent-loops`` / ``-nloop N``: number of execution → review
+      cycles (default 5).
+   -  ``--agent-iterations`` / ``-niter N``: tool-call budget per cycle
+      (default 12).
+
+For further detail on agent and loop internals see the in-tree docs:
+
+-  ``docs/agent.md`` — agent architecture and bounded-mode policy
+-  ``docs/loop.md`` — loop mode internals and on-disk artifacts
+-  ``docs/tools.md`` — tool implementations (read/glob/bash/edit/write)
+-  ``docs/models.md`` — model backends and environment variables
 
 ***************
  Agentic Modes
 ***************
 
-Codescribe now includes two agent-oriented workflows in addition to the
+Codescribe includes two agent-oriented workflows in addition to the
 prompt-driven translation and generation commands.
 
 #. **Agent mode** runs a single tool-using agent session on a task.
    The available tools are:
 
-   - ``read``: read file contents with optional line offsets
-   - ``bash``: run shell commands (use this for ``ls``, ``find``, ``grep``, etc.)
-   - ``edit``: perform exact-text replacements in files
-   - ``write``: create or overwrite files
+   -  ``read``: read file contents with optional line offsets
+   -  ``glob``: list files matching a pattern
+   -  ``bash``: run shell commands
+   -  ``edit``: perform exact-text replacements in files
+   -  ``write``: create or overwrite files
 
 #. **Loop mode** runs multiple fresh agent sessions over a task file.
    Each session is intentionally stateless and must infer project state
@@ -305,90 +323,36 @@ with a message similar to:
 ***************************
 
 #. **OpenAI Models**: Codescribe supports OpenAI's GPT models (such as
-   `gpt-4`, `gpt-3.5-turbo`, etc.) via the OpenAI API. The ``openai-``
-   prefix is required when specifying OpenAI models. For example, to use
-   `gpt-4o`:
+   ``gpt-4o``, ``gpt-4``, ``gpt-3.5-turbo``, etc.) via the OpenAI API.
+   The ``openai-`` prefix is required when specifying OpenAI models.
+   For example, to use ``gpt-4o``:
 
    .. code:: bash
 
       ▶ code-scribe translate <filelist> -m openai-gpt-4o -p <seed_prompt.toml>
 
-   Ensure that the environment variable `OPENAI_API_KEY` is set with
-   your OpenAI API key. You can set it by running the following command
-   in your terminal:
+   Ensure that the environment variable ``OPENAI_API_KEY`` is set:
 
    .. code:: bash
 
       export OPENAI_API_KEY="your_openai_api_key_here"
 
-   And you have installed the OpenAI library:
+   And install the OpenAI library:
 
    .. code:: bash
 
       pip install openai
 
-#. **Hugging Face Transformers (TFModel)**: You can use a local Hugging
-   Face / Transformers checkpoint by passing its path as the model
-   argument. Codescribe supports this through the ``TFModel`` backend.
-
-   To use a Hugging Face model, first install the necessary libraries if
-   not already installed:
-
-   .. code:: bash
-
-      pip install transformers torch
-
-   Then specify the path to the pre-trained model using the `-m` flag in
-   the command. For example, to use a GPT-2 model:
-
-   .. code:: bash
-
-      ▶ code-scribe translate <filelist> -m <path_to_model> -p <seed_prompt.toml>
-
-   You can download a model from the Hugging Face model hub by visiting
-   `https://huggingface.co/models` and choosing one that fits your
-   needs.
-
-#. **ARGO Models (legacy / environment-specific)**: Codescribe also supports
-   Argonne's ARGO models via the ``argo-`` prefix.
-
-   **Note**: Unlike ``openai-*``, ``anthropic-*``, and ``oaic-*``, ARGO does
-   **not** support native tool calling in the current implementation, so
-   agentic workflows use the text-protocol fallback.
-
-   ARGO requires access to an ARGO endpoint and is mainly useful in
-   environments where it is already provisioned.
-
-   .. code:: bash
-
-      ▶ code-scribe translate <filelist> -m argo-gpt4o -p <seed_prompt.toml>
-
-   Environment variables:
-
-   .. code:: bash
-
-      export ARGO_USER="your_argo_username"
-      export ARGO_API_ENDPOINT="argo_api_endpoint"
-
 #. **Anthropic Models**: Codescribe supports Anthropic's Claude models
-   (such as `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`,
-   etc.) via the Anthropic API. The ``anthropic-`` prefix is required
-   when specifying these models. For example, to use Claude Opus 4.8:
-
-   Optional: set ``ANTHROPIC_BASE_URL`` to override the API base URL.
-
-   .. code:: bash
-
-      export ANTHROPIC_BASE_URL="https://api.anthropic.com"
-
-   (Most users should not need this.)
+   (such as ``claude-opus-4-8``, ``claude-sonnet-4-6``,
+   ``claude-haiku-4-5``, etc.) via the Anthropic API. The
+   ``anthropic-`` prefix is required. For example, to use Claude Opus:
 
    .. code:: bash
 
       ▶ code-scribe translate <filelist> -m anthropic-claude-opus-4-8 -p <seed_prompt.toml>
 
-   Ensure that the environment variable `ANTHROPIC_API_KEY` is set with
-   your Anthropic API key:
+   Ensure that the environment variable ``ANTHROPIC_API_KEY`` is set:
 
    .. code:: bash
 
@@ -400,18 +364,16 @@ with a message similar to:
 
       pip install anthropic
 
+   Optionally set ``ANTHROPIC_BASE_URL`` to redirect requests to a
+   compatible proxy or private endpoint.
+
 #. **OpenAI-Compatible Endpoints (Ollama, ALCF, etc.)**: Codescribe
    supports any OpenAI-compatible API endpoint via the ``oaic-`` prefix.
    The ``oaic-`` prefix is **required** — it routes the request to the
    endpoint configured via ``OPENAI_COMP_BASEURL``. This makes it
    straightforward to use on-premises models such as Ollama or hosted
-   inference services.
-
-   **This is the recommended backend** for most users because it works
-   with many providers that expose an OpenAI-compatible API.
-
-   For example, to use a locally running Ollama instance with
-   `llama3.1`:
+   inference services. For example, to use a locally running Ollama
+   instance with ``llama3.1``:
 
    .. code:: bash
 
@@ -434,8 +396,45 @@ with a message similar to:
    the Python backend even if the upstream compatible endpoint itself
    does not require authentication.
 
-   **Note**: For ALCF inference endpoints, set `OPENAI_COMP_PROVIDER` to
-   a value containing `alcf` (e.g., `alcf-inference`).
+   **Note**: For ALCF inference endpoints, set ``OPENAI_COMP_PROVIDER``
+   to a value containing ``alcf`` (e.g., ``alcf-inference``).
+
+#. **ARGO Models**: Codescribe also supports integration with Argonne's
+   ARGO models, such as ``argo-gpt4o``. The ``argo-`` prefix is
+   required. These models are accessible on the Argonne network by
+   setting ``ARGO_USER`` and ``ARGO_API_ENDPOINT``:
+
+   .. code:: bash
+
+      ▶ code-scribe translate <filelist> -m argo-gpt4o -p <seed_prompt.toml>
+
+   .. code:: bash
+
+      export ARGO_USER="your_argo_username"
+      export ARGO_API_ENDPOINT="argo_api_endpoint"
+
+   ARGO models are recommended for users with access to the Argonne
+   network.
+
+#. **Hugging Face Transformers (TFModel)**: You can use a local Hugging
+   Face / Transformers checkpoint by passing its path as the model
+   argument. Codescribe supports this through the ``TFModel`` backend.
+
+   To use a Hugging Face model, first install the necessary libraries:
+
+   .. code:: bash
+
+      pip install transformers torch
+
+   Then specify the path to the pre-trained model using the ``-m`` flag.
+   For example, to use a GPT-2 model:
+
+   .. code:: bash
+
+      ▶ code-scribe translate <filelist> -m <path_to_model> -p <seed_prompt.toml>
+
+   You can download a model from the Hugging Face model hub by visiting
+   https://huggingface.co/models.
 
 #. **Saving Custom Prompts**: Instead of selecting a model and running
    a command immediately, you can save the generated prompts for later
@@ -449,6 +448,9 @@ with a message similar to:
    For ``inspect``, the saved prompt is written to ``scribe.json``. For
    ``translate``, prompt files are generated per source file.
 
+Please see the source file ``codescribe/lib/_llm.py`` for full backend
+implementation details.
+
 ***********************
  Environment Variables
 ***********************
@@ -456,20 +458,20 @@ with a message similar to:
 Codescribe uses different environment variables depending on the model
 backend you select.
 
--  ``OPENAI_API_KEY`` for ``openai-`` models
--  ``ANTHROPIC_API_KEY`` for ``anthropic-`` models
--  ``ANTHROPIC_BASE_URL`` (optional) for ``anthropic-`` models
--  ``ARGO_USER`` and ``ARGO_API_ENDPOINT`` for ``argo-`` models
+-  ``CODESCRIBE_MODEL``: default model name used when ``-m`` is omitted.
+-  ``CODESCRIBE_MAX_TOKENS``: maximum output tokens per model reply
+   (default: 24576).
+-  ``OPENAI_API_KEY`` for ``openai-*`` models
+-  ``ANTHROPIC_API_KEY`` for ``anthropic-*`` models
+-  ``ANTHROPIC_BASE_URL`` (optional) for ``anthropic-*`` proxy endpoints
+-  ``ARGO_USER`` and ``ARGO_API_ENDPOINT`` for ``argo-*`` models
 -  ``OPENAI_COMP_BASEURL``, ``OPENAI_COMP_PROVIDER``, and
-   ``OPENAI_COMP_APIKEY`` for ``oaic-`` models
--  ``CODESCRIBE_ARCHIVE`` to save prompt/response transcripts for later
-   analysis
+   ``OPENAI_COMP_APIKEY`` for ``oaic-*`` models
+-  ``CODESCRIBE_ARCHIVE``: directory path for saving LLM interaction
+   transcripts for downstream analysis or debugging
 
-For more backend details, see ``docs/models.md``.
-
-To archive interactions with LLMs for downstream analysis or debugging,
-set ``CODESCRIBE_ARCHIVE`` to a directory path where the interactions
-will be stored:
+To archive interactions with LLMs, set ``CODESCRIBE_ARCHIVE`` to a
+directory path where the interactions will be stored:
 
 .. code:: bash
 
@@ -478,35 +480,41 @@ will be stored:
 Archived conversations are written as TOML files under a dated folder
 structure.
 
-*********************************
+*************************************
  Bounded Loop Diagnostics and Caveats
-*********************************
+*************************************
 
 When using ``code-scribe loop`` the agent runs with bounded tools rooted
-at the working directory.
+at the working directory. In particular, bounded ``bash`` is deliberately
+restrictive:
 
-Bounded mode is intentionally restrictive (especially bounded ``bash``).
-The exact allowlist and blocked characters are implementation details and
-may evolve; see ``codescribe/lib/_agent.py`` for the authoritative policy.
+-  shell metacharacters such as ``|``, ``&``, ``;``, ``>``, ``<``,
+   backticks, ``$``, and backslashes are rejected
+-  explicit executable paths are rejected
+-  absolute paths and ``..`` path escapes are rejected
+-  only a small allowlist of commands is permitted, including ``ls``,
+   ``pwd``, ``find``, ``grep``, ``head``, ``tail``, ``wc``, ``git``,
+   ``test``, ``echo``, and ``sed``
 
-A few common failure modes you may see in bounded mode:
+This means commands such as the following will fail in bounded mode:
 
 .. code:: text
 
    bash   find generated-src -type f -name '*.py'
    err    shell metacharacters are not allowed in bounded mode
 
+   bash   cd generated-src && python -m tests.test_cg
+   err    shell metacharacters are not allowed in bounded mode
+
    bash   python generated-src/tests/test_cg.py
    err    command 'python' is not allowed in bounded mode
 
-For the full architecture and bounded-mode design rationale, see
-``docs/agent.md``.
+   bash   python3 generated-src/tests/test_cg.py
+   err    command 'python3' is not allowed in bounded mode
 
-By following these steps, you can integrate any of the supported
-language models into Codescribe and use them for incremental
-translation, inspection, generation, update, and bounded agentic
-workflows. Please see the source file ``codescribe/lib/_llm.py`` for
-backend details.
+These diagnostics are expected and useful: they show exactly how the
+bounded tool layer constrains an agent session. See ``docs/loop.md`` for
+the full bounded-mode policy and how to configure ``--workdir``.
 
 **********
  Citation
@@ -521,7 +529,7 @@ backend details.
    year         = 2026,
    publisher    = {Zenodo},
    version      = {2026.02},
-   doi          = {10.5281/zenodo.18738066}
+   doi          = {10.5281/zenodo.18738066},
    url          = {https://github.com/akashdhruv/Codescribe}
    }
 

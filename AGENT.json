@@ -1,20 +1,24 @@
 {
   "schema_version": "1.0",
   "name": "CodeScribe",
-  "title": "CodeScribe — AGENT card",
+  "title": "CodeScribe — agent card",
   "what_this_repo_is": {
-    "summary": "CodeScribe is an AI-assisted framework for scientific software development.",
+    "summary": "AI-assisted framework for scientific software development: incremental Fortran→C++ translation plus code inspection/generation/update and tool-using agent workflows.",
     "capabilities": [
-      "Incremental Fortran → C++ translation (with interface layers)",
-      "Code inspection / generation / update",
-      "Tool-using “coding agent” workflows (`read`, `bash`, `edit`, `write`)"
+      "Incremental Fortran → C++ translation (with interface-layer support)",
+      "Code inspection, generation, and update",
+      "Tool-using coding agent workflows (read/glob/bash/edit/write)",
+      "Bounded execution→review loop over a task file with durable on-disk state"
     ],
-    "usage_note": "Use this repo when you need automated, repo-aware code changes with an auditable tool loop."
+    "entry_points": [
+      "CLI: code-scribe (see --help)",
+      "Agent runtime: codescribe/lib/_agent.py",
+      "Tool implementations: codescribe/lib/_tools.py",
+      "Model backends: codescribe/lib/_llm.py",
+      "Loop runtime: codescribe/lib/_loop.py"
+    ]
   },
   "install": {
-    "notes": [
-      "Recommended: use a virtual environment."
-    ],
     "commands": [
       "python3 -m venv env",
       "source env/bin/activate",
@@ -24,91 +28,130 @@
     ]
   },
   "model_setup": {
-    "topic": "OpenAI-compatible endpoints",
-    "supports": "OpenAI-compatible backends via the `oaic-` model prefix.",
+    "recommended": "OpenAI-compatible endpoints (oaic-*)",
     "environment_variables": [
+      {
+        "name": "CODESCRIBE_MODEL",
+        "required": false,
+        "description": "Default model name used when -m/--model is omitted.",
+        "example": "oaic-llama3.1"
+      },
+      {
+        "name": "CODESCRIBE_MAX_TOKENS",
+        "required": false,
+        "description": "Maximum output tokens the model may generate per reply. Applies to all backends. Default: 24576.",
+        "example": "8192"
+      },
       {
         "name": "OPENAI_COMP_BASEURL",
         "required": true,
-        "description": "Base URL of the OpenAI-compatible API (must include /v1).",
+        "description": "Base URL of an OpenAI-compatible API (must include /v1). Used by oaic-* models.",
         "example": "http://localhost:11434/v1"
       },
       {
         "name": "OPENAI_COMP_PROVIDER",
         "required": true,
-        "description": "Provider label (used internally for auth routing).",
+        "description": "Provider label used for routing/auth policy (e.g. ollama, alcf-inference). Used by oaic-* models.",
         "example": "ollama"
       },
       {
         "name": "OPENAI_COMP_APIKEY",
         "required": true,
-        "description": "Required by the current implementation (even if the endpoint itself needs no auth).",
+        "description": "API key for the oaic-* client. Some local endpoints accept any placeholder.",
         "example": "placeholder"
+      },
+      {
+        "name": "OPENAI_API_KEY",
+        "required": false,
+        "description": "API key for hosted OpenAI models (openai-* prefix).",
+        "example": "sk-..."
+      },
+      {
+        "name": "ANTHROPIC_API_KEY",
+        "required": false,
+        "description": "API key for Anthropic models (anthropic-* prefix).",
+        "example": "sk-ant-..."
+      },
+      {
+        "name": "ANTHROPIC_BASE_URL",
+        "required": false,
+        "description": "Optional base URL override for Anthropic models (e.g. a proxy endpoint).",
+        "example": "https://my-proxy.internal/anthropic"
+      },
+      {
+        "name": "ARGO_USER",
+        "required": false,
+        "description": "Username for the ARGO endpoint (argo-* prefix).",
+        "example": "jdoe"
+      },
+      {
+        "name": "ARGO_API_ENDPOINT",
+        "required": false,
+        "description": "Full URL of the ARGO inference API (argo-* prefix).",
+        "example": "https://argo.example.org/v1/chat"
       }
     ],
-    "example_command": "code-scribe inspect README.rst -m oaic-llama3.1 -q \"Summarize this project and list key entry points.\"",
+    "example_command": "code-scribe inspect README.rst -m oaic-llama3.1 -q \"Summarize this repo and list key entry points.\"",
     "docs": [
       {
         "path": "docs/models.md",
-        "description": "Other backends/env vars"
+        "description": "Backends and env vars"
       }
-    ]
-  },
-  "discover_capabilities": {
-    "description": "CodeScribe workflows are exposed as CLI subcommands.",
-    "commands": [
-      "code-scribe --help",
-      "code-scribe agent --help",
-      "code-scribe loop --help",
-      "code-scribe inspect --help",
-      "code-scribe generate --help",
-      "code-scribe update --help",
-      "code-scribe translate --help",
-      "code-scribe index --help"
     ]
   },
   "safety": {
-    "bounded_vs_unbounded": [
+    "modes": [
       {
-        "mode": "loop",
+        "command": "loop",
         "bounded": true,
-        "recommended": true,
-        "description": "Runs repeated fresh sessions over a task file and uses bounded tools rooted at the working tree. This reduces risk from arbitrary shell commands and path escapes.",
+        "description": "Repeated execution→review cycles. Cross-loop state is carried in-memory; each cycle starts a fresh agent whose context is injected by the harness. On-disk artifacts under .codescribe/loop/ are for inspection and crash-resume only.",
+        "options": {
+          "--workdir DIR": "Root directory the agent is bounded to (default: cwd)",
+          "--agent-loops/-nloop N": "Number of execution→review cycles (default: 5)",
+          "--agent-iterations/-niter N": "Tool-call budget per cycle (default: 12)",
+          "--verbose/-v": "Stream per-iteration tool calls and token usage to stdout",
+          "--log": "Write TOML diagnostic events to the default path: .codescribe/logs/toolusage.toml",
+          "--log-path PATH": "Write TOML diagnostic events to PATH (implies --log)"
+        },
         "artifacts": [
-          ".codescribe/loop/status.json",
-          ".codescribe/loop/report.md"
+          ".codescribe/loop/run.toml",
+          ".codescribe/loop/state.toml",
+          ".codescribe/loop/execution.toml",
+          ".codescribe/loop/review_output.toml",
+          ".codescribe/loop/review.toml"
         ]
       },
       {
-        "mode": "agent",
+        "command": "agent",
         "bounded": false,
-        "recommended": false,
-        "description": "Runs a single tool-using session. Useful for interactive, one-off tasks and may be less restricted than loop mode."
+        "description": "Single agent session with unbounded tools (use with care).",
+        "options": {
+          "--agent-iterations/-niter N": "Maximum tool-call iterations (default: 20)",
+          "--verbose/-v": "Stream per-iteration tool calls and token usage to stdout",
+          "--log": "Write TOML diagnostic events to the default path: .codescribe/logs/toolusage.toml",
+          "--log-path PATH": "Write TOML diagnostic events to PATH (implies --log)"
+        }
       }
     ],
     "notes": [
-      "Bounded mode is a practical constraint layer, not an OS sandbox."
+      "Bounded mode is a practical constraint layer, not an OS sandbox.",
+      "Bounded bash uses an allowlist and rejects shell metacharacters; some commands will fail by design.",
+      "The loop task file can extend the bash allowlist via a [tools] bash = [...] TOML section.",
+      "TOML diagnostic logs include tool_start (with model_reasoning) and tool_end (with output_preview) events for post-run inspection."
     ],
     "docs": [
       {
         "path": "docs/agent.md",
-        "description": "Bounded mode details"
+        "description": "Agent architecture and bounded-mode policy"
+      },
+      {
+        "path": "docs/loop.md",
+        "description": "Loop mode internals and on-disk artifacts"
+      },
+      {
+        "path": "docs/tools.md",
+        "description": "Tool implementations (read/glob/bash/edit/write)"
       }
     ]
-  },
-  "minimal_workflows": [
-    {
-      "name": "Single agent session",
-      "command": "code-scribe agent \"Find failing tests and propose a minimal fix.\" -m oaic-llama3.1"
-    },
-    {
-      "name": "Bounded loop over a task file",
-      "command": "code-scribe loop task.md -m oaic-llama3.1"
-    }
-  ],
-  "considerations": [
-    "Agent runs are capped by an iteration limit; tasks may stop early if not completed.",
-    "Bounded `bash` is allowlisted and rejects shell metacharacters; some commands will fail by design.",
-    "Prefer `edit` for precise changes to existing files; use `write` for new/fully replaced files."
-  ]
+  }
 }

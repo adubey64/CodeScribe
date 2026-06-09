@@ -1,1031 +1,175 @@
-# Agent internals: `codescribe/lib/_agent.py`
+# Agent internals (`codescribe/lib/_agent.py`)
 
-This document explains how the standalone coding agent in `codescribe/lib/_agent.py` works, why it is structured the way it is, and what design constraints shape its behavior.
+This document is a *practical map* of the standalone coding agent.
+It explains what the agent does, how tool calling works, and where the
+safety boundaries are, without re-stating the entire source file.
 
-The goal is to give a full mental model without drowning in detail: after reading this, you should be able to follow the control flow, understand the safety boundaries, and modify the implementation with confidence.
+If you're modifying behavior, treat the code as authoritative:
+`codescribe/lib/_agent.py`.
 
-## Table of contents
+## What the agent is
 
-- [1. What this module is for](#1-what-this-module-is-for)
-- [2. Core design idea](#2-core-design-idea)
-- [3. Big-picture structure](#3-big-picture-structure)
-- [4. The text fallback protocol](#4-the-text-fallback-protocol)
-- [5. Regex parsing layer](#5-regex-parsing-layer)
-- [6. `_TEXT_PROTOCOL_PREAMBLE`: the fallback system prompt](#6-_text_protocol_preamble-the-fallback-system-prompt)
-- [7. Exported symbols](#7-exported-symbols)
-- [8. Tool abstraction: `AgentTool`](#8-tool-abstraction-agenttool)
-- [9. `ReadTool`](#9-readtool)
-- [10. `BashTool`](#10-bashtool)
-- [11. `EditTool`](#11-edittool)
-- [12. `WriteTool`](#12-writetool)
-- [13. Path safety: `_resolve_within_root()`](#13-path-safety-_resolve_within_root)
-- [14. Tool factory: `make_bounded_tools()`](#14-tool-factory-make_bounded_tools)
-- [15. `DEFAULT_TOOLS`](#15-default_tools)
-- [16. Token estimation utilities](#16-token-estimation-utilities)
-- [17. Display helpers for verbose mode](#17-display-helpers-for-verbose-mode)
-- [18. Schema validation: `_validate_schema_value()`](#18-schema-validation-_validate_schema_value)
-- [19. Output control: `_truncate_for_model()`](#19-output-control-_truncate_for_model)
-- [20. The `Agent` class: overall responsibility](#20-the-agent-class-overall-responsibility)
-- [21. `Agent.__init__()`](#21-agent__init__)
-- [22. Tool enable/disable controls](#22-tool-enabledisable-controls)
-- [23. Prompt and schema generation](#23-prompt-and-schema-generation)
-- [24. Tool execution gateway: `_execute()`](#24-tool-execution-gateway-_execute)
-- [25. Parsing helpers inside `Agent`](#25-parsing-helpers-inside-agent)
-- [26. `_print_thinking()`](#26-_print_thinking)
-- [27. Native tool loop: `_run_native_tools()`](#27-native-tool-loop-_run_native_tools)
-- [28. Fallback text loop: `_run_text_protocol()`](#28-fallback-text-loop-_run_text_protocol)
-- [29. Public entry point: `run()`](#29-public-entry-point-run)
-- [30. Invariants the module tries to maintain](#30-invariants-the-module-tries-to-maintain)
-- [31. Failure behavior](#31-failure-behavior)
-- [32. Safety model: what this file does and does not guarantee](#32-safety-model-what-this-file-does-and-does-not-guarantee)
-- [33. Relationship to the rest of Codescribe](#33-relationship-to-the-rest-of-codescribe)
-- [34. Common extension points](#34-common-extension-points)
-- [35. Practical reading guide to the source](#35-practical-reading-guide-to-the-source)
-- [36. Summary](#36-summary)
-
----
-
-## 1. What this module is for
-
-`codescribe/lib/_agent.py` implements a **small, backend-agnostic coding agent**.
-
-At a high level, the agent does three things:
+The agent is a small runtime that:
 
 1. sends a task to an LLM,
-2. lets the LLM request tool executions such as reading files or running shell commands,
-3. repeats this loop until the model returns a final answer.
+2. lets the model request tool executions (`read`, `glob`, `bash`, `edit`, `write`),
+3. feeds tool results back to the model,
+4. repeats until a final answer (or iteration limit).
 
-This module is intentionally narrow in scope. It does **not** define model backends itself; instead, it expects a model object from `codescribe/lib/_llm.py` that exposes a chat interface. The agent is therefore a coordination layer between:
+It is backend-agnostic: the model implementation lives in
+`codescribe/lib/_llm.py`.
 
-- a language model,
-- a set of local tools,
-- and an iterative control loop.
+## Tool-calling protocol
 
-In practice, this is the part of Codescribe that powers agentic workflows like:
+All backends implement a common `chat_with_tools()` interface that the agent
+calls each iteration. What differs is how each backend translates that into a
+provider request:
 
-- inspecting a project,
-- reading files before answering,
-- making exact file edits,
-- writing new files,
-- and operating in either unrestricted or bounded project mode.
+### Provider-native tool calling
 
----
+OpenAI (`openai-*`), Anthropic (`anthropic-*`), and OpenAI-compatible endpoints
+(`oaic-*`) pass tool schemas to the provider and receive structured tool call
+responses. This is the preferred path.
 
-## 2. Core design idea
+Completion rule: a model response with **no tool calls** is treated as the
+final answer.
 
-The module is built around a simple principle:
+### Strict-JSON emulation
 
-> **The model decides what to do next, but the Python code remains the source of truth for tool execution, validation, and filesystem effects.**
+ARGO (`argo-*`) and local Transformers checkpoints (path) do not support
+provider-native tool calling. Their `chat_with_tools()` implementations inject
+a system prompt that enforces a strict JSON output schema:
 
-That principle leads to the main design choices:
-
-- tools are represented as Python classes,
-- tool arguments are schema-checked before execution,
-- tool output is always fed back into the loop as plain text,
-- the loop is capped by `agent_iterations`,
-- and there are two execution modes depending on backend capability:
-  - **native tool calling**, if the model supports it,
-  - **text-protocol fallback**, if it does not.
-
-This split is the most important architectural feature in the file.
-
----
-
-## 3. Big-picture structure
-
-From top to bottom, the file contains:
-
-1. **text-protocol definitions** for models without native tool support,
-2. **tool base class and concrete tool implementations**,
-3. **path-bounding and tool factory helpers**,
-4. **small utility functions** for token counting, summaries, validation, and truncation,
-5. the **`Agent` class**, which runs the control loop.
-
-A readable mental model is:
-
-```text
-User task
-   |
-   v
-Agent.run(...)
-   |
-   +--> native tool mode? ---- yes ---> _run_native_tools()
-   |                                 |
-   |                                 v
-   |                         model requests tool calls
-   |                                 |
-   |                                 v
-   |                           _execute(tool,args)
-   |                                 |
-   |                                 v
-   |                          tool results returned
-   |                                 |
-   |                                 v
-   |                           final text answer
-   |
-   +--> no ---> _run_text_protocol()
-                                     |
-                                     v
-                           model emits <tool_call> blocks
-                                     |
-                                     v
-                               _execute(tool,args)
-                                     |
-                                     v
-                           <tool_result> blocks returned
-                                     |
-                                     v
-                         model emits <final_answer> block
+```json
+{
+  "text": "optional explanation",
+  "tool_calls": [{"id": "...", "name": "...", "arguments": {...}}]
+}
 ```
 
-Markdown cannot natively render a true diagram beyond fenced text, so the code block above is the simplest portable diagram for GitHub-style Markdown.
+The provider response is parsed by `_parse_strict_tool_json()` in `_llm.py`.
+The agent itself does not differentiate between native and emulated tool
+calls — both paths normalize to the same `{"text", "tool_calls", "usage"}`
+dict.
 
----
+## Tools and safety boundaries
 
-## 4. The text fallback protocol
+Tool implementations live in `codescribe/lib/_tools.py`.
 
-Not every model backend can perform structured tool calling. To support those models, the module defines a lightweight text protocol.
+### File tools (`read`, `glob`, `edit`, `write`)
 
-The model is instructed to emit one of three tagged blocks:
+In **bounded** mode (used by `code-scribe loop`), paths are resolved under a
+configured root and attempts to escape the root are rejected.
 
-- `<tool_call> ... </tool_call>`
-- `<tool_result> ... </tool_result>`
-- `<final_answer> ... </final_answer>`
+`edit` performs **exact** `oldText → newText` replacement and requires
+`oldText` to be unique and non-overlapping.
 
-### 4.1 Tool-call format
+### `bash`
 
-The expected payload is JSON:
+- Unbounded mode: runs arbitrary shell commands.
+- Bounded mode: validates an allowlisted command set and rejects common shell
+  metacharacters and path escapes.
 
-```text
-<tool_call>
-{"name": "read", "args": {"path": "README.rst"}}
-</tool_call>
-```
+Bounded mode is a constraint layer for "stay in the working tree" workflows.
+It is **not** an OS sandbox.
 
-### 4.2 Tool-result format
+Default bounded allowlist: `ls`, `pwd`, `find`, `grep`, `head`, `tail`, `wc`,
+`git`, `test`, `echo`, `sed`. Loop task files can extend this via a
+`[tools] bash = [...]` TOML section.
 
-After the Python side executes a tool, it sends the result back like this:
+## Tool-call budget and repetition policy
 
-```text
-<tool_result>
-{"name": "read", "output": "...file contents..."}
-</tool_result>
-```
+Three internal limits govern tool execution within a single `Agent.run()` call:
 
-### 4.3 Final-answer format
+| Limit | Default | Meaning |
+|---|---|---|
+| `_max_tool_calls_total` | 120 | Hard cap across the entire run; the agent stops and returns an error string if reached. |
+| `_max_tool_calls_per_iteration` | 10 | At most this many tool calls are executed per LLM turn; excess calls are skipped and the model is notified. |
+| `_max_repeated_calls` | 2 | Identical `(tool, args)` pairs are blocked after this many uses (6 for `read`). Counts reset after a successful `edit` or `write` (workspace changed). |
 
-Once all needed tool work is done, the model must return:
+Tool outputs larger than 8 000 characters are truncated in the message history to
+prevent unbounded context growth. Errors and small outputs are always passed in
+full. The model is told how many characters were omitted and how to page through
+the rest using `read(path, offset=N)`.
 
-```text
-<final_answer>
-Done.
-</final_answer>
-```
+## Workspace context injection
 
-### 4.4 Why tagged blocks are used
+Each iteration the agent injects a compact `WORKSPACE CONTEXT` system
+message with the current iteration count, total tool-call budget used, recent
+tool results, and recent errors. This gives the model lightweight grounding
+without growing the conversation unboundedly.
 
-The fallback protocol uses explicit tags because they are:
+## Where this shows up in the CLI
 
-- easy to detect with regex,
-- easy to explain in a system prompt,
-- backend-independent,
-- and robust enough for simple iterative tool use.
+- `code-scribe agent`: single agent run (unbounded tools)
+- `code-scribe loop`: repeated fresh sessions (bounded tools; writes reports)
 
-This is not as strict as a full parser-driven protocol, but it is intentionally minimal.
+## Key extension points
 
----
+- Add a new tool: implement an `AgentTool` subclass in `_tools.py` and include
+  it in the tool list.
+- Adjust bounded policy: update bounded `bash` allowlist / blocked characters,
+  or path resolution rules in `_resolve_within_root()`.
+- Add a logging sink: implement a class with an `.emit(dict)` method and pass
+  it as `logging=` to `Agent()`. Use `MultiToolLogSink([sink1, sink2])` to fan
+  out to multiple sinks simultaneously (e.g. two TOML log files, or a TOML file
+  + a custom telemetry sink). The built-in `ToolLogToml` sink writes
+  append-only TOML event files; its default path is
+  `.codescribe/logs/toolusage.toml`.
+- Enable/disable individual tools at runtime via `agent.enable_tool(name)` and
+  `agent.disable_tool(name)`. The underlying `AgentTool.enabled` flag controls
+  whether the tool is included in the schema sent to the model and whether
+  execution is permitted.
+- Each `tool_start` event includes `model_reasoning` (first 500 chars of the
+  model's preceding text that triggered the tool call).
+- Each `tool_end` event includes `output_preview` (first 500 chars of actual tool
+  output), `ok` (bool), `error` (string or null), and `duration_ms`.
+  Downstream consumers such as the loop review agent can use `output_preview` to
+  cross-check model-reported results against real tool outputs.
+- Tool outputs are passed to the model as-is — no summarization, no truncation,
+  no `RAW:` wrapper. The `_summarize_tool_output()` helper is used only to
+  populate the compact `WORKSPACE CONTEXT` grounding block, not the model messages.
 
-## 5. Regex parsing layer
+## Relation to existing agent frameworks
 
-Two module-level regex patterns support the text protocol:
+CodeScribe's agent is a deliberate design point in a space occupied by several well-studied frameworks. The sections below place it against the most relevant ones, noting where it converges, where it diverges, and where the divergence is intentional.
 
-- `_TOOL_CALL_RE`
-- `_FINAL_ANSWER_RE`
+### ReAct (Yao et al., 2022)
 
-They are both compiled with `re.DOTALL`, which means `.` matches across line breaks. That matters because tool payloads and final answers may span multiple lines.
+ReAct ("Synergizing Reasoning and Acting in Language Models", arXiv:2210.03629) is the direct ancestor of CodeScribe's inner loop. The ReAct pattern interleaves *thought* (a chain-of-thought reasoning trace), *action* (a tool call), and *observation* (the tool's return value), cycling until the task is resolved. CodeScribe follows this faithfully: native tool calls are the Action, and tool result messages are the Observation. The system prompt comment in `_agent.py` (`_REACT_NUDGE`) explicitly references this framing.
 
-This design keeps parsing simple:
+The difference is operational rather than conceptual. ReAct as described in the paper accumulates the full thought–action–observation trajectory in the prompt context across all steps. CodeScribe does **not** grow the conversation unboundedly: instead, each iteration replaces a compact `WORKSPACE CONTEXT` system message that summarises iteration count, total tool-call budget, recent tool results, and recent errors. The full message list is still passed to the model, but the grounding block stays fixed-size. This trades a fraction of per-step context richness for predictable context growth, which matters when agents run for tens of iterations on large codebases.
 
-- find all `<tool_call>` blocks,
-- try to `json.loads(...)` each payload,
-- find the first `<final_answer>` block if present.
+### Reflexion (Shinn et al., 2023)
 
-The parser is intentionally permissive in one sense and strict in another:
+Reflexion (arXiv:2303.11366) adds a verbal self-reflection step after each failed episode: the agent produces a natural-language critique of what went wrong, stores it in an episodic memory buffer, and carries that buffer into the next attempt. The reinforcement signal is linguistic rather than gradient-based.
 
-- permissive about whitespace and multiline content,
-- strict that the payload itself must decode as JSON object data.
+CodeScribe's review agent in loop mode is structurally similar but architecturally separate. The review agent is a *different agent instance* that receives a harness-computed summary of verified actions (derived deterministically from the TOML event log — no LLM involved) and writes a structured `review_output.toml` with pending next steps. It is not the same model reflecting on its own output — it is a second model evaluating an external evidence record. This separation is intentional: it reduces the risk of the reviewer rationalising the executor's mistakes and enforces a strict evidential standard (the review task prompt instructs the reviewer to flag any `<final_answer>` claim not backed by a verified action). Reflexion collapses executor and reflector into a single agent; CodeScribe keeps them structurally distinct.
 
----
+### SWE-agent (Yang et al., 2024)
 
-## 6. `_TEXT_PROTOCOL_PREAMBLE`: the fallback system prompt
+SWE-agent (arXiv:2405.15793) introduces the concept of an Agent-Computer Interface (ACI): a purpose-built toolset designed specifically for the needs of an LM agent rather than a human developer. The ACI includes a custom file viewer that shows ~100 lines per turn with scroll and in-file search commands, linting on edit submission, and a directory-search tool that returns only filenames (not match context). SWE-agent runs a single agent instance against a bash shell.
 
-`_TEXT_PROTOCOL_PREAMBLE` is the instruction template injected into the system message when using fallback mode.
+CodeScribe's tool design is more minimal. It provides `read`, `glob`, `bash`, `edit`, and `write` without ACI-style scaffolding: no built-in scroll command, no automatic linting on edit, no specialised file viewer. The tradeoff is flexibility — CodeScribe's tools are general-purpose and provider-agnostic — at the cost of not having the ergonomic guardrails that SWE-agent's ACI provides. One area where CodeScribe is more careful than SWE-agent's default: repetition detection. The agent tracks a `call_counts` dict per run and blocks repeated identical tool calls (with a higher limit for `read` and a reset after successful `edit`/`write`), preventing the model from spinning in a read loop.
 
-It explains:
+### CodeAct (Wang et al., 2024)
 
-- what the agent is,
-- what tools exist,
-- the exact required tool-call format,
-- that multiple tool calls may appear in one response,
-- that the model must continue after receiving tool results,
-- and that `<final_answer>` must only appear after all required tool use is complete.
+CodeAct (arXiv:2402.01030) replaces structured tool calls with executable Python: the model emits a Python snippet, which runs in an integrated interpreter, and stdout/stderr feed back as the next observation. This collapses the distinction between "tool schema" and "action" — any library-level operation is available, and the agent can self-debug by inspecting interpreter output.
 
-The preamble is important because fallback mode has no API-level enforcement. The prompt is doing protocol specification work that native tool APIs would otherwise handle.
+CodeScribe takes the opposite position. Tool calls are schema-validated, named, and bounded; `bash` is the escape hatch for arbitrary shell work, but it operates under an allowlist in loop mode. The CodeAct approach grants a significantly larger action space at the cost of safety: arbitrary code execution in a shared interpreter is difficult to bound. CodeScribe's bounded bash allowlist (`ls`, `pwd`, `find`, `grep`, `git`, etc., extensible via TOML) is a weaker sandbox — it is a constraint layer, not an OS-level isolation — but it makes the action space auditable and prevents the most common classes of runaway filesystem damage during unattended loop runs.
 
----
+### OpenHands / OpenDevin (Wang et al., 2024)
 
-## 7. Exported symbols
+OpenHands (arXiv:2407.16741, formerly OpenDevin) is a platform-scale system built around a persistent event stream. All agent observations and actions are appended to a shared event log; agents consume from this stream and emit new events. The architecture supports multi-agent delegation: a primary orchestrator agent can spawn sub-agents for subtasks, and sub-agents report back through the same event stream. Execution happens inside a Docker sandbox, and the platform supports thousands of concurrent sessions.
 
-The module-level `__all__` exposes the public API:
+CodeScribe's scope is narrower in almost every dimension. There is no event stream beyond the per-run TOML event log; there is no runtime agent delegation (the two-agent loop is static: executor then reviewer, in sequence, no dynamic spawning); there is no container sandbox. The session boundary is a Python process lifetime — cross-loop state is carried in-memory by `prompt_loop()` and on-disk artifacts under `.codescribe/loop/` are for inspection and crash-resume only. This is a constraint, but it is also a deployability property: CodeScribe has no daemon, no REST API, and no Docker dependency. It runs wherever Python runs.
 
-- `AgentTool`
-- `ReadTool`
-- `BashTool`
-- `EditTool`
-- `WriteTool`
-- `make_bounded_tools`
-- `DEFAULT_TOOLS`
-- `Agent`
+### LangGraph
 
-This tells readers which names are intended as reusable building blocks.
+LangGraph structures agent execution as a directed graph with a central `StateGraph` object. Nodes are functions (LLM calls or tool runs); edges route between them, with conditional edges enabling the cyclical patterns that agents require. State is a typed dictionary updated incrementally at each node. Persistence, human-in-the-loop checkpoints, and multi-agent composition are first-class features of the graph runtime.
 
----
+CodeScribe does not use a graph runtime. Its loop is a Python `for` loop over `range(agent_loops)`, with the execution/review alternation expressed as sequential function calls inside that loop. This is less expressive for complex branching logic — there is no conditional routing, no checkpoint/resume, and no dynamic graph rewriting — but it is also significantly simpler to audit, extend, and embed in other Python code. LangGraph's state management is richer; CodeScribe's equivalent is the `_state` dict inside a single `Agent.run()` call (ephemeral, per-run) plus the `loop_summaries` and `pending_items` lists held in-memory by `prompt_loop()` across loop iterations. On-disk files under `.codescribe/loop/` exist for inspection and crash-resume, not as the primary state relay.
 
-## 8. Tool abstraction: `AgentTool`
+### Summary
 
-`AgentTool` is the base class for all tools.
-
-It stores four pieces of metadata:
-
-- `name`
-- `description`
-- `parameters`
-- `enabled`
-
-and defines three methods:
-
-- `run(args)` — to be implemented by subclasses,
-- `to_openai_tool()` — converts the tool into a function schema for native tool-calling APIs,
-- `describe_for_prompt()` — renders a human-readable description plus JSON schema for prompt injection.
-
-### Why this abstraction exists
-
-The agent must support the same tools in two very different contexts:
-
-1. as structured schemas passed to a native tool-calling backend,
-2. as plain-text descriptions embedded in a fallback prompt.
-
-`AgentTool` centralizes the information needed for both.
-
----
-
-## 9. `ReadTool`
-
-`ReadTool` reads text files.
-
-### Inputs
-
-- `path` — required
-- `offset` — optional, 1-indexed line start
-- `limit` — optional maximum line count
-
-### Behavior
-
-`run()` performs the following steps:
-
-1. validate that `path` exists,
-2. if a root is configured, resolve the path through `_resolve_within_root()`,
-3. ensure the path exists and is a file,
-4. open with `errors="replace"`,
-5. read all lines,
-6. slice lines according to `offset` and `limit`,
-7. return the selected text.
-
-### Important details
-
-- `offset` is treated as **1-indexed**, which is more natural for users.
-- `errors="replace"` favors robustness over strict encoding failure.
-- if the slice is empty, the tool returns `""` rather than an error.
-
-### Why this tool is simple
-
-The tool does not attempt syntax-aware reading, binary safety, or pagination metadata. It is intentionally plain: the agent can call it repeatedly if it needs more context.
-
----
-
-## 10. `BashTool`
-
-`BashTool` executes shell commands.
-
-This is the most powerful and potentially risky tool in the file, so it has two operating modes.
-
-### 10.1 Unbounded mode
-
-In normal mode:
-
-- the command is passed to `subprocess.run(..., shell=True, ...)`,
-- the current working directory may be set,
-- stdout and stderr are captured,
-- a timeout is applied.
-
-This is flexible but deliberately trusts the surrounding environment.
-
-### 10.2 Bounded mode
-
-In bounded mode:
-
-- the command is first validated by `_validate_bounded_command()`,
-- then executed with `shell=False` and `shlex.split(cmd)`,
-- only a small allowlist of commands is accepted,
-- shell metacharacters are rejected,
-- path escapes are rejected.
-
-This mode is designed for safer project-local loops.
-
-### 10.3 Blocked shell features
-
-Bounded `bash` rejects a small set of shell metacharacters.
-
-The exact set is an implementation detail (see `BashTool._BLOCKED_CHARS` in
-`codescribe/lib/_agent.py`) and may evolve.
-
-These are rejected in bounded mode because they enable piping, redirection, command chaining, interpolation, or escaping behavior that would make command validation much weaker.
-
-### 10.4 Allowed commands
-
-Bounded `bash` uses a small allowlist.
-
-The exact allowlist is an implementation detail (see `BashTool._DEFAULT_ALLOWED` in
-`codescribe/lib/_agent.py`) and may evolve.
-
-The allowlist keeps the tool useful for inspection while preventing general arbitrary program execution.
-
-### 10.5 Path checks in bounded mode
-
-For non-option tokens, bounded validation rejects:
-
-- tokens containing `..`
-- absolute paths starting with `/`
-- explicit executable paths containing `/`
-
-This does not create a perfect sandbox, but it enforces a practical “stay inside the working tree” rule.
-
-### 10.6 Output formatting
-
-`_format_result()` returns a normalized string such as:
-
-```text
-exit_code: 0
-
-STDOUT:
-...
-
-STDERR:
-...
-```
-
-This textual form is easy for the model to consume in both native and fallback loops.
-
-### Design tradeoff
-
-`BashTool` chooses **predictable text output** over rich structured output. That makes downstream logic simpler, but it means the model must parse plain text if it wants detailed shell semantics.
-
----
-
-## 11. `EditTool`
-
-`EditTool` performs exact text replacement inside an existing file.
-
-It is intentionally conservative.
-
-### Inputs
-
-- `path`
-- `edits`, where each entry contains:
-  - `oldText`
-  - `newText`
-
-### Execution model
-
-All replacements are matched against the **original file contents**, not incrementally against prior edits in the same request.
-
-This is a major design choice.
-
-### Why this matters
-
-It prevents order-dependent behavior. If edits were applied one by one and later edits matched the already-modified file, then the result could depend on edit ordering. This implementation avoids that.
-
-### Validation steps
-
-For each edit, the tool ensures:
-
-- the edit entry is an object,
-- both `oldText` and `newText` are present,
-- `oldText` exists in the original file,
-- `oldText` is unique in the original file,
-- matched spans do not overlap each other.
-
-If any condition fails, the whole edit call fails.
-
-### Reconstruction strategy
-
-After locating all matches, the tool:
-
-1. sorts matches by start offset,
-2. checks for overlap,
-3. rebuilds the file from untouched slices plus replacement text,
-4. writes the updated file back.
-
-### Why exact replacement is valuable
-
-This tool is safer than “rewrite arbitrary file fragment” logic because it requires the model to anchor edits to known original text. That reduces accidental corruption and makes failures explicit when context is stale.
-
----
-
-## 12. `WriteTool`
-
-`WriteTool` creates or overwrites a file with full contents.
-
-### Inputs
-
-- `path`
-- `content`
-
-### Behavior
-
-It:
-
-1. validates arguments,
-2. resolves the path within the configured root if needed,
-3. blocks writes to protected paths,
-4. creates parent directories with `os.makedirs(..., exist_ok=True)`,
-5. writes the provided content.
-
-### Role in the tool set
-
-`WriteTool` complements `EditTool`:
-
-- use `edit` when modifying an existing file precisely,
-- use `write` when creating a new file or replacing an entire file.
-
-This separation is important because it nudges the model toward more controlled updates when a file already exists.
-
----
-
-## 13. Path safety: `_resolve_within_root()`
-
-This helper is central to bounded file access.
-
-Given a root directory and a user-supplied target path, it:
-
-1. resolves the root,
-2. resolves the candidate path, interpreting relative paths under the root,
-3. checks that the resolved candidate is still inside the root using `relative_to(root)`.
-
-If that last step fails, it raises:
-
-- `ValueError("Path escapes working directory: ...")`
-
-### Why this method is effective
-
-It protects against common escape patterns such as:
-
-- `../outside.txt`
-- nested relative traversal
-- absolute paths outside the root
-
-This is the main filesystem-boundary mechanism for `read`, `edit`, and `write` in bounded mode.
-
----
-
-## 14. Tool factory: `make_bounded_tools()`
-
-`make_bounded_tools()` is a convenience constructor for bounded agent sessions.
-
-It always includes:
-
-- `ReadTool(root=root)`
-- `BashTool(cwd=root, bounded=True)`
-
-and conditionally includes:
-
-- `EditTool(root=root, protected_paths=...)`
-- `WriteTool(root=root, protected_paths=...)`
-
-depending on `allow_write`.
-
-### Why a factory function exists
-
-The same bounded configuration is needed repeatedly by higher-level workflows like loop mode. Packaging it in one function avoids duplicated setup logic and keeps the policy explicit.
-
----
-
-## 15. `DEFAULT_TOOLS`
-
-`DEFAULT_TOOLS` is the unbounded tool set:
-
-- `ReadTool()`
-- `BashTool()`
-- `EditTool()`
-- `WriteTool()`
-
-This is what `Agent` uses if no custom tool list is provided.
-
----
-
-## 16. Token estimation utilities
-
-The module includes lightweight token accounting helpers:
-
-- `_count_tokens(text)`
-- `_count_message_tokens(messages)`
-- `_usage_in_out(usage)`
-
-### 16.1 `_count_tokens()`
-
-This estimates token count as roughly 1 token per 4 characters.
-
-That is a heuristic, not a tokenizer. Its purpose is operational visibility, not billing precision.
-
-### 16.2 `_count_message_tokens()`
-
-This sums estimated token counts across message contents. It supports both:
-
-- string content,
-- list content serialized through JSON.
-
-### 16.3 `_usage_in_out()`
-
-This normalizes usage dictionaries from different backend naming conventions:
-
-- `prompt_tokens` or `input_tokens`
-- `completion_tokens` or `output_tokens`
-
-### Why these helpers exist
-
-Model backends do not always report token usage uniformly, and some may report nothing at all. These helpers let the agent show approximate usage in verbose mode either from true backend data or from fallback estimates.
-
----
-
-## 17. Display helpers for verbose mode
-
-Two helpers exist mainly to keep console output readable:
-
-- `_fmt_args(name, args)`
-- `_fmt_result(name, output)`
-
-They produce short previews such as:
-
-- the path being read,
-- the number of edits in an edit call,
-- a summarized bash result,
-- or a shortened error message.
-
-These functions do not affect correctness. They improve observability.
-
----
-
-## 18. Schema validation: `_validate_schema_value()`
-
-This helper validates tool arguments against a simplified JSON-schema-like structure.
-
-Supported schema types are:
-
-- `object`
-- `array`
-- `string`
-- `integer`
-
-It checks things like:
-
-- required keys,
-- unexpected extra keys when `additionalProperties=False`,
-- integer minimum values,
-- array minimum length,
-- nested item validation.
-
-### Why validate here if tools also validate internally?
-
-Because there are two layers of defense:
-
-1. **schema-level validation** catches malformed requests early and consistently,
-2. **tool-level validation** handles semantic checks specific to the tool implementation.
-
-For example:
-
-- schema validation can say `args.limit must be >= 1`,
-- tool logic can say `file not found` or `oldText is not unique`.
-
-This split is clean and useful.
-
----
-
-## 19. Output control: `_truncate_for_model()`
-
-Large tool outputs can overwhelm model context windows. `_truncate_for_model()` limits returned text to a maximum number of characters, defaulting to `4000`.
-
-If truncation is needed, it keeps:
-
-- the beginning,
-- the end,
-- and inserts a middle marker describing how many characters were removed.
-
-This is a pragmatic choice: the beginning and end of command output or file content are often the most informative parts.
-
----
-
-## 20. The `Agent` class: overall responsibility
-
-`Agent` orchestrates everything.
-
-It owns:
-
-- a model object,
-- a private map of tools,
-- iteration limits,
-- verbose/thinking display settings.
-
-The class is not a tool itself and not an LLM backend. It is the controller that connects both sides.
-
----
-
-## 21. `Agent.__init__()`
-
-Constructor inputs are:
-
-- `model`
-- `tools=None`
-- `max_iterations=20`
-- `show_diagnostics=False`
-- `tool_output_max_chars=4000`
-- `diagnostics=None`
-
-### Important design detail: tool copying
-
-The constructor builds:
-
-```python
-self._tools = {t.name: copy.copy(t) for t in source}
-```
-
-This means the agent gets shallow copies of the provided tool objects rather than reusing them directly.
-
-### Why that matters
-
-It prevents one agent instance from accidentally toggling `enabled` state on shared tool instances used elsewhere.
-
-The copy is shallow, which is enough here because the main mutable runtime field of concern is `enabled`.
-
----
-
-## 22. Tool enable/disable controls
-
-The methods:
-
-- `enable_tool(name)`
-- `disable_tool(name)`
-
-toggle tool availability.
-
-If a tool name is unknown, they raise `ValueError`.
-
-This provides a simple policy knob at runtime without rebuilding the whole agent.
-
----
-
-## 23. Prompt and schema generation
-
-Two methods derive representations of enabled tools:
-
-- `_system_prompt(extra="")`
-- `_tool_schemas()`
-
-### `_system_prompt()`
-
-Used in fallback mode. It renders the text preamble plus a list of tools and their JSON schemas.
-
-### `_tool_schemas()`
-
-Used in native mode. It emits structured tool definitions via `to_openai_tool()`.
-
-These two methods reflect the same underlying tool metadata in different forms.
-
----
-
-## 24. Tool execution gateway: `_execute()`
-
-All tool invocations pass through `_execute(name, args)`.
-
-This method is a critical choke point.
-
-It enforces, in order:
-
-1. the tool name must exist,
-2. the tool must be enabled,
-3. arguments must be a dictionary,
-4. arguments must satisfy schema validation,
-5. only then is `tool.run(args)` called.
-
-### Why centralization matters
-
-Without this gateway, each loop implementation would need to duplicate execution checks. Centralizing execution ensures that native and fallback modes obey the same rules.
-
----
-
-## 25. Parsing helpers inside `Agent`
-
-Two static methods support fallback mode:
-
-- `_parse_tool_calls(text)`
-- `_parse_final_answer(text)`
-
-### `_parse_tool_calls()`
-
-It finds all `<tool_call>` blocks, decodes JSON payloads, and returns a list.
-
-If JSON decoding fails, it does not crash. Instead it returns a synthetic record containing `_parse_error` and `_raw`.
-
-That is a good design choice because malformed model output becomes recoverable conversational state instead of a Python exception.
-
-### `_parse_final_answer()`
-
-It returns the stripped text inside the first `<final_answer>` block, or `None` if absent.
-
----
-
-## 26. `_print_thinking()`
-
-This currently prints only:
-
-```text
-  iter N
-```
-
-It is intentionally minimal and acts as a hook for verbose tracing. Most of the rich printing happens in the loop methods themselves.
-
----
-
-## 27. Native tool loop: `_run_native_tools()`
-
-This method is used when the model backend advertises native tool support.
-
-### 27.1 Message initialization
-
-The conversation begins with:
-
-- optional system message,
-- optional chat history,
-- current user task.
-
-### 27.2 Main loop
-
-For each iteration up to `agent_iterations`:
-
-1. call `self.model.chat_with_tools(messages, self._tool_schemas())`,
-2. extract returned text and `tool_calls`,
-3. account for token usage,
-4. if tool calls are present:
-   - execute each through `_execute()`,
-   - truncate outputs for model safety,
-   - convert results back into backend-specific message format using `self.model.format_tool_result_messages(...)`,
-   - append those messages and continue,
-5. if plain text is present with no tool calls, return it as the final answer.
-
-If the loop exhausts its iteration budget, it returns a stop message.
-
-### 27.3 Notable design choices
-
-#### Backend abstraction
-
-The agent assumes the model provides:
-
-- `chat_with_tools(...)`
-- `format_tool_result_messages(...)`
-
-That keeps this module independent of backend-specific wire formats.
-
-#### Tool results are truncated before re-injection
-
-This prevents giant outputs from dominating context.
-
-#### Final-answer semantics are simpler than fallback mode
-
-In native mode, any non-empty text response without tool calls is treated as completion. There is no `<final_answer>` wrapper because the backend already gives a structured tool-call channel.
-
----
-
-## 28. Fallback text loop: `_run_text_protocol()`
-
-This method implements the same idea as native mode, but using prompt discipline and regex parsing.
-
-### 28.1 Initial messages
-
-The first system message is always the generated text-protocol prompt from `_system_prompt(system)`.
-
-Then optional chat history and the user task are appended.
-
-### 28.2 Extra loop state
-
-Fallback mode tracks two additional booleans:
-
-- `tool_calls_ever_made`
-- `final_without_tools_pushed`
-
-These exist because text-only models often try to answer directly without actually using tools.
-
-### 28.3 Main loop behavior
-
-On each iteration:
-
-1. estimate input token cost for the full current context,
-2. call `self.model.chat(messages)`,
-3. estimate output tokens,
-4. parse tool calls first,
-5. if tool calls exist:
-   - mark that tools have been used,
-   - append the assistant response to history,
-   - execute each call,
-   - create `<tool_result>` blocks,
-   - append them as a user message,
-   - continue,
-6. otherwise parse `<final_answer>`,
-7. if a final answer is found before any tool was ever used:
-   - push back once with a corrective reminder,
-   - allow the model another chance,
-8. if a valid final answer is accepted, return it,
-9. otherwise push back with a general nudge requiring either tool use or `<final_answer>`.
-
-### 28.4 Why tool calls are checked before final answer
-
-A single model response might include both a tool call and a `<final_answer>`. The implementation executes tool calls first and ignores the final answer for that turn.
-
-That is the correct choice: otherwise the model could claim completion before performing required actions.
-
-### 28.5 Why the “one pushback” logic exists
-
-If the first response is just a final answer, the agent gives one explicit reminder not to simulate actions. This improves compliance without creating an endless argument loop.
-
----
-
-## 29. Public entry point: `run()`
-
-`Agent.run()` is the only method most callers need.
-
-It selects execution mode based on backend capabilities:
-
-- if `model.supports_native_tools` is true and `chat_with_tools` exists, use `_run_native_tools()`,
-- otherwise use `_run_text_protocol()`.
-
-This makes the agent backend-adaptive while keeping the external API small.
-
----
-
-## 30. Invariants the module tries to maintain
-
-Several important invariants shape the implementation.
-
-### Tool effects happen only through Python
-
-The model may request actions, but it never performs them directly. Every file read, edit, write, or shell command is executed by Python code.
-
-### Tool arguments are validated before execution
-
-Malformed calls should fail as tool errors, not crash the agent loop.
-
-### Bounded file access stays under a root
-
-For file tools, path resolution must remain inside the configured root.
-
-### Edit operations are anchored to original text
-
-All replacements are based on the original file snapshot for that call.
-
-### Agent loops must terminate
-
-`agent_iterations` prevents infinite back-and-forth.
-
-These invariants are more important than any individual helper function.
-
----
-
-## 31. Failure behavior
-
-The module generally prefers **returning explicit error strings** over raising exceptions into the outer loop.
-
-Examples include:
-
-- missing tool arguments,
-- file not found,
-- schema mismatch,
-- parse errors in fallback tool calls,
-- bounded-command validation failures,
-- command timeouts.
-
-This design is agent-friendly. The model can read the error and adapt its next step.
-
-The tradeoff is that callers must not mistake a returned string for a successful structured result. Inside this module, that is acceptable because tool outputs are always treated as text.
-
----
-
-## 32. Safety model: what this file does and does not guarantee
-
-This module adds useful guardrails, but it is not a hardened sandbox.
-
-### It does provide
-
-- working-tree confinement for `read`, `edit`, and `write` in bounded mode,
-- a restrictive command allowlist for bounded `bash`,
-- rejection of common shell metacharacters,
-- protected-path support for read-only files.
-
-### It does not provide
-
-- OS-level sandboxing,
-- resource isolation beyond subprocess timeout,
-- complete prevention of all shell abuse in unbounded mode,
-- complete semantic understanding of every shell token.
-
-So the right mental model is:
-
-> bounded mode is a practical constraint layer for agent workflows, not a security boundary equivalent to a container or VM.
-
----
-
-## 33. Relationship to the rest of Codescribe
-
-`codescribe/lib/_agent.py` is intentionally decoupled from translation-specific logic.
-
-That makes it reusable across multiple CLI commands and workflows. The surrounding codebase can decide:
-
-- which model to instantiate,
-- whether tools should be bounded,
-- which files should be protected,
-- whether writes should be allowed,
-- how verbose the run should be.
-
-This separation is good design: the agent handles **how to run a tool-using loop**, while higher-level commands decide **what policy and task to apply**.
-
----
-
-## 34. Common extension points
-
-If you want to evolve this module, the most natural extension points are:
-
-### Add a new tool
-
-Create a new `AgentTool` subclass with:
-
-- a name,
-- a description,
-- a parameter schema,
-- a `run()` implementation.
-
-Then include it in a tool list passed to `Agent` or a custom factory.
-
-### Tighten bounded bash rules
-
-Modify:
-
-- `_DEFAULT_ALLOWED`,
-- `_BLOCKED_CHARS`,
-- or `_validate_bounded_command()`.
-
-### Improve fallback parsing
-
-Replace regex parsing with a stricter parser if needed.
-
-### Improve token accounting
-
-Swap heuristic counting for tokenizer-specific accounting if backend consistency becomes important.
-
----
-
-## 35. Practical reading guide to the source
-
-If you are opening the code for the first time, a good reading order is:
-
-1. `Agent.run()`
-2. `_run_native_tools()` and `_run_text_protocol()`
-3. `_execute()`
-4. the four concrete tool classes
-5. `_resolve_within_root()` and `make_bounded_tools()`
-6. utility helpers
-
-That order follows the runtime flow rather than file order.
-
----
-
-## 36. Summary
-
-`codescribe/lib/_agent.py` implements a compact but carefully structured coding agent.
-
-Its main ideas are:
-
-- represent tools as Python objects with schemas,
-- validate every tool call centrally,
-- support both native-tool and text-protocol backends,
-- keep tool output textual and model-readable,
-- provide bounded-mode restrictions for project-local loops,
-- and guarantee termination through iteration limits.
-
-In short, the module is best understood as a **portable agent runtime**: small enough to read in one sitting, but rich enough to support real file- and shell-based coding workflows.
+CodeScribe occupies a specific point in this design space: a **minimal, in-memory-state, two-agent loop** with a stateless-per-session inner agent. It inherits ReAct's reasoning structure, applies a Reflexion-like review phase via a structurally separate second agent that evaluates harness-computed evidence rather than a rendered transcript, and enforces a bounded tool policy similar in spirit to SWE-agent's ACI but simpler in implementation. Relative to OpenHands and LangGraph it forgoes platform features (delegation, event streams, graph routing, container isolation) in exchange for zero infrastructure dependencies and a codebase small enough to read in one sitting. The known gaps — no streaming, no model-failure retry, no wall-clock timeout, no OS-level sandbox — are areas where the more platform-oriented frameworks have already invested.

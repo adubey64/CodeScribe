@@ -2,6 +2,12 @@
 
 Codescribe selects an LLM backend based on the prefix of the `-m/--model` argument.
 
+## Common environment variable
+
+- `CODESCRIBE_MAX_TOKENS` — maximum output tokens the model may generate per reply.
+  Applies to all backends. Default: `24576`.
+  Example: `export CODESCRIBE_MAX_TOKENS=8192`
+
 ## Recommended: OpenAI-compatible endpoints (`oaic-*`)
 
 Use this when you have **any OpenAI-compatible `/v1` API** (self-hosted or managed). This is the most portable backend and is generally the recommended default.
@@ -34,8 +40,11 @@ Tool calling:
 - Model prefix: `anthropic-...`
 - Env vars:
   - `ANTHROPIC_API_KEY`
-  - `ANTHROPIC_BASE_URL` (optional; override API base URL)
+  - `ANTHROPIC_BASE_URL` (optional; override API base URL, e.g. for a proxy)
 - Tool calling: **native tool calling supported**
+- Note: both `chat()` and `chat_with_tools()` prefer the streaming API
+  (`client.messages.stream`) and fall back to non-streaming if the SDK or
+  provider does not support it.
 
 ## ARGO (`argo-*`)
 
@@ -43,11 +52,15 @@ ARGO is supported primarily for environments where the ARGO endpoint is availabl
 
 - Model prefix: `argo-...`
 - Env vars: `ARGO_USER`, `ARGO_API_ENDPOINT`
-- Tool calling: **no native tool calling**; agent mode uses the **text-protocol fallback**.
+- Tool calling: **no provider-native tool calling**; the backend uses a
+  **strict-JSON emulation** — tool schemas are injected into the system prompt
+  and the model is required to respond with a JSON object (`text` + `tool_calls`).
 
 ## Local Hugging Face / Transformers checkpoint (path)
 
 If `-m` is a filesystem path, Codescribe uses a local Transformers pipeline.
 
 - Model argument: path to a checkpoint directory
-- Tool calling: **no native tool calling**; agent mode uses the **text-protocol fallback**.
+- Tool calling: **no provider-native tool calling**; same **strict-JSON emulation**
+  as ARGO — schemas are injected into the system prompt and the model must
+  return a structured JSON object.
