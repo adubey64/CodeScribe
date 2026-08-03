@@ -1,9 +1,13 @@
-"""Command line interface for Jobrunner"""
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
+
+"""Command-line commands for CodeScribe."""
 
 # Standard libraries
 import os
 from pathlib import Path
-from typing import Union, List
+from typing import Iterable, List, Optional, Union
 
 # Feature libraries
 import click
@@ -11,6 +15,27 @@ import click
 from codescribe.cli import code_scribe
 from codescribe import api
 from codescribe import lib
+
+
+def _require_model(model: Optional[Union[str, Path]]) -> Union[str, Path]:
+    if not model:
+        raise click.UsageError(
+            "Please provide the '--model/-m' option (or set CODESCRIBE_MODEL)"
+        )
+    return model
+
+
+def _to_paths(values: Iterable[Union[str, Path]]) -> List[Path]:
+    return [Path(value) for value in values]
+
+
+def _resolve_logging(log_enabled: bool, log_path: Optional[str]) -> Optional[str]:
+    if log_path is not None:
+        return log_path
+    if log_enabled:
+        # Empty string means "use default log path" in ToolLogToml.
+        return ""
+    return None
 
 
 @code_scribe.command(name="index")
@@ -44,7 +69,7 @@ def draft(fortran_files: List[Path]) -> None:
     prepare a list of files for generative AI use
     \b
     """
-    api.draft([Path(file) for file in fortran_files])
+    api.draft(_to_paths(fortran_files))
 
 
 @code_scribe.command(name="translate")
@@ -75,15 +100,10 @@ def translate(
     interface
     \b
     """
-    if not model:
-        raise click.UsageError(
-            "Please provide the '--model/-m' option (or set CODESCRIBE_MODEL)"
-        )
-
     api.translate(
-        [Path(file) for file in fortran_files],
+        _to_paths(fortran_files),
         Path(seed_prompt),
-        model,
+        _require_model(model),
     )
 
 
@@ -118,15 +138,10 @@ def generate(
     based on specifications given in the prompt
     \b
     """
-    if not model:
-        raise click.UsageError(
-            "Please provide the '--model/-m' option (or set CODESCRIBE_MODEL)"
-        )
-
     api.generate(
         seed_query_prompt,
-        model,
-        [Path(file) for file in reference_existing],
+        _require_model(model),
+        _to_paths(reference_existing),
     )
 
 
@@ -160,7 +175,7 @@ def update(
     filelist: List[Path],
     seed_prompt: Path,
     query_prompt: str,
-    model: [Path, str],
+    model: Union[Path, str],
     reference_existing: List[Path],
 ) -> None:
     """
@@ -179,11 +194,11 @@ def update(
         )
 
     api.update(
-        [Path(file) for file in filelist],
+        _to_paths(filelist),
         model,
         seed_prompt,
         query_prompt,
-        [Path(file) for file in reference_existing],
+        _to_paths(reference_existing),
     )
 
 
@@ -221,15 +236,10 @@ def inspect(
     on the the combination of files
     \b
     """
-    if not model:
-        raise click.UsageError(
-            "Please provide the '--model/-m' option (or set CODESCRIBE_MODEL)"
-        )
-
     api.inspect(
-        [Path(file) for file in fortran_files],
+        _to_paths(fortran_files),
         query_prompt,
-        model,
+        _require_model(model),
         verbose=verbose,
     )
 
@@ -250,7 +260,7 @@ def format(seed_prompt_list: List[Path]) -> None:
     format
     \b
     """
-    api.format([Path(file) for file in seed_prompt_list])
+    api.format(_to_paths(seed_prompt_list))
 
 
 @code_scribe.command(name="agent")
@@ -293,6 +303,12 @@ def format(seed_prompt_list: List[Path]) -> None:
     type=click.Path(dir_okay=True, file_okay=True, writable=True),
     help="Write agent diagnostic events (TOML) to PATH (implies --log).",
 )
+@click.option(
+    "--reason",
+    "reason",
+    is_flag=True,
+    help="Enable adaptive thinking (Anthropic models only; ignored for other backends).",
+)
 def agent(
     task: str,
     model: Union[str, Path],
@@ -300,6 +316,7 @@ def agent(
     verbose: bool,
     log_enabled: bool,
     log_path: Union[str, None],
+    reason: bool,
 ) -> None:
     """
     \b
@@ -312,19 +329,13 @@ def agent(
     Available tools: read, bash, edit, write
     \b
     """
-    effective_log = None
-    if log_path is not None:
-        effective_log = log_path
-    elif log_enabled:
-        # Empty string means "use default log path" in ToolLogToml.
-        effective_log = ""
-
     result = api.agent(
         task,
-        model,
+        _require_model(model),
         agent_iterations=agent_iterations,
         verbose=verbose,
-        logging=effective_log,
+        logging=_resolve_logging(log_enabled, log_path),
+        reason=reason,
     )
     click.echo(result)
 
@@ -348,7 +359,7 @@ def agent(
 @click.option(
     "--agent-iterations",
     "-niter",
-    default=12,
+    default=30,
     show_default=True,
     help="Maximum tool-call iterations per agent session",
 )
@@ -382,6 +393,12 @@ def agent(
     type=click.Path(dir_okay=True, file_okay=True, writable=True),
     help="Write agent diagnostic events (TOML) to PATH (implies --log).",
 )
+@click.option(
+    "--reason",
+    "reason",
+    is_flag=True,
+    help="Enable adaptive thinking (Anthropic models only; ignored for other backends).",
+)
 def loop(
     task_file: Path,
     model: Union[str, Path],
@@ -391,6 +408,7 @@ def loop(
     verbose: bool,
     log_enabled: bool,
     log_path: Union[str, None],
+    reason: bool,
 ) -> None:
     """
     \b
@@ -398,25 +416,20 @@ def loop(
     \b
 
     \b
-    Each loop runs a fresh agent session that reads the task file,
-    picks the single most important next task, executes it, writes
-    a session report, and exits. State is inferred only from files.
+    Each loop runs a fresh bounded author session over the task file.
+    The author agent tries to complete as much remaining work as possible
+    in that session, and a separate review phase runs when needed.
+    Cross-loop continuity is carried by harness-injected summaries.
     \b
     """
-    effective_log = None
-    if log_path is not None:
-        effective_log = log_path
-    elif log_enabled:
-        # Empty string means "use default log path" in ToolLogToml.
-        effective_log = ""
-
     result = api.loop(
         task_file=Path(task_file),
-        model=model,
+        model=_require_model(model),
         agent_loops=agent_loops,
         agent_iterations=agent_iterations,
         verbose=verbose,
-        logging=effective_log,
+        logging=_resolve_logging(log_enabled, log_path),
         workdir=Path(workdir) if workdir else None,
+        reason=reason,
     )
     click.echo(result)

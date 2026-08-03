@@ -1,9 +1,11 @@
-"""Command line interface for Jobrunner"""
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
 
-import os
+"""Public API entry points for CodeScribe commands."""
 
 from pathlib import Path
-from typing import Union, List
+from typing import List, Optional, Union
 
 from codescribe import lib
 
@@ -61,7 +63,7 @@ def inspect(
 def generate(
     seed_query_prompt: Union[Path, str],
     model: Union[Path, str],
-    reference_existing: List[Path] = [],
+    reference_existing: Optional[List[Path]] = None,
 ) -> None:
     """
     API command for generating files
@@ -69,16 +71,16 @@ def generate(
     lib.prompt_generate(
         seed_query_prompt,
         model=model,
-        reference_existing=reference_existing,
+        reference_existing=reference_existing or [],
     )
 
 
 def update(
     filelist: List[Path],
     model: Union[Path, str],
-    seed_prompt: Union[Path, None] = None,
+    seed_prompt: Optional[Path] = None,
     query_prompt: str = "",
-    reference_existing: List[Path] = [],
+    reference_existing: Optional[List[Path]] = None,
 ) -> None:
     """
     API command for updating files
@@ -91,7 +93,7 @@ def update(
         seed_prompt,
         query_prompt,
         model=model,
-        reference_existing=reference_existing,
+        reference_existing=reference_existing or [],
     )
 
 
@@ -109,6 +111,7 @@ def agent(
     agent_iterations: int = 20,
     verbose: bool = False,
     logging: Union[Path, str, None] = None,
+    reason: bool = False,
 ) -> str:
     """
     API command for running the agentic loop on a task
@@ -119,6 +122,7 @@ def agent(
         agent_iterations=agent_iterations,
         verbose=verbose,
         logging=logging,
+        reason=reason,
     )
 
 
@@ -126,10 +130,11 @@ def loop(
     task_file: Path,
     model: Union[Path, str],
     agent_loops: int = 5,
-    agent_iterations: int = 12,
+    agent_iterations: int = 30,
     verbose: bool = False,
     logging: Union[Path, str, None] = None,
     workdir: Union[Path, None] = None,
+    reason: bool = False,
 ) -> str:
     """
     API command for running the bounded loop
@@ -142,4 +147,6 @@ def loop(
         verbose=verbose,
         logging=logging,
         workdir=workdir,
+        reason=reason,
     )
+

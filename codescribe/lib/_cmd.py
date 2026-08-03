@@ -1,3 +1,7 @@
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
+
 import re
 import os, json, textwrap
 
@@ -6,6 +10,14 @@ from pathlib import Path
 from alive_progress import alive_bar
 
 from codescribe import lib
+
+__all__ = [
+    "prompt_translate",
+    "prompt_inspect",
+    "prompt_generate",
+    "prompt_update",
+    "prompt_agent",
+]
 
 
 def prompt_translate(
@@ -96,10 +108,10 @@ def prompt_translate(
                         if fsource:
                             fdest.write(fsource.group(1))
 
-                #lib.write_archive_toml(
+                # lib.write_archive_toml(
                 #    chat_template + [{"role": "assistant", "content": result}],
                 #    neural_model,
-                #)
+                # )
 
                 chat_template[-1]["content"] = cached_prompt
 
@@ -166,7 +178,7 @@ def prompt_inspect(
         show_diagnostics=verbose,
     )
     result = coding_agent.run(task, system=system)
-    print(result)
+    print(result.final_text or str(result))
 
 
 def prompt_generate(
@@ -230,17 +242,23 @@ def prompt_generate(
         result = neural_model.chat(chat_template)
 
         pattern = re.compile(r"<([^>]+)>\s*(.*?)\s*</\1>", re.DOTALL)
+        cwd_root = Path.cwd().resolve()
 
         for match in pattern.finditer(result):
             filename, content = match.groups()
-            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-            with open(filename, "w") as f:
+            try:
+                target = lib.AgentTool.resolve_within_root(cwd_root, filename)
+            except ValueError as exc:
+                print(f"Skipped {filename!r}: {exc}")
+                continue
+            os.makedirs(target.parent, exist_ok=True)
+            with open(target, "w") as f:
                 f.write(content.strip() + "\n")
-            print(f"Wrote {filename}")
+            print(f"Wrote {target}")
 
-        #lib.write_archive_toml(
+        # lib.write_archive_toml(
         #    chat_template + [{"role": "assistant", "content": result}], neural_model
-        #)
+        # )
 
 
 def prompt_update(
@@ -329,17 +347,27 @@ def prompt_update(
         result = neural_model.chat(chat_template)
 
         pattern = re.compile(r"<([^>]+)>\s*(.*?)\s*</\1>", re.DOTALL)
+        cwd_root = Path.cwd().resolve()
+        allowed_targets = {Path(f).resolve() for f in filelist}
 
         for match in pattern.finditer(result):
             filename, content = match.groups()
-            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
-            with open(filename, "w") as f:
+            try:
+                target = lib.AgentTool.resolve_within_root(cwd_root, filename)
+            except ValueError as exc:
+                print(f"Skipped {filename!r}: {exc}")
+                continue
+            if target not in allowed_targets:
+                print(f"Skipped {filename!r}: not in the requested file list")
+                continue
+            os.makedirs(target.parent, exist_ok=True)
+            with open(target, "w") as f:
                 f.write(content.strip() + "\n")
-            print(f"Wrote {filename}")
+            print(f"Wrote {target}")
 
-        #lib.write_archive_toml(
+        # lib.write_archive_toml(
         #    chat_template + [{"role": "assistant", "content": result}], neural_model
-        #)
+        # )
 
 
 def prompt_agent(
@@ -348,6 +376,7 @@ def prompt_agent(
     agent_iterations: int = 20,
     verbose: bool = False,
     logging: Optional[Union[Path, str]] = None,
+    reason: bool = False,
 ) -> str:
     """Run the agentic loop on *task* using the supplied model string.
 
@@ -359,7 +388,7 @@ def prompt_agent(
     Set verbose=True to print agent diagnostics (per-iteration reasoning and tool calls)
     to stdout as the agent works.
     """
-    neural_model = lib.set_neural_model(model)
+    neural_model = lib.set_neural_model(model, reasoning=reason)
 
     logfile = None
     if logging is not None:
@@ -377,4 +406,4 @@ def prompt_agent(
         show_diagnostics=verbose,
         logging=logfile,
     )
-    return coding_agent.run(task)
+    return str(coding_agent.run(task))

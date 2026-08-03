@@ -1,3 +1,7 @@
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
+
 """_telemetry
 """
 
@@ -17,7 +21,26 @@ import toml
 
 from codescribe import lib
 
-def write_archive_toml(chat_entries: List[Dict[str, str]], neural_model: object) -> None:
+__all__ = [
+    "write_archive_toml",
+    "iso_utc_now",
+    "new_run_id",
+    "atomic_write_text",
+    "atomic_write_toml",
+    "read_toml",
+    "append_toml_event",
+    "read_toml_events",
+    "ToolLogSink",
+    "NullToolLogSink",
+    "MultiToolLogSink",
+    "ToolLogToml",
+    "Timer",
+]
+
+
+def write_archive_toml(
+    chat_entries: List[Dict[str, str]], neural_model: object
+) -> None:
     """Write a chat archive TOML file under `.codescribe/chat/`.
 
     Folder structure: YYYY/MM/DD/timestamp_sha.toml
@@ -93,6 +116,7 @@ def read_toml(path: Path) -> Dict[str, Any]:
 # TOML event log (replaces JSONL)
 # ---------------------------------------------------------------------------
 
+
 def _toml_val(v: Any) -> Optional[str]:
     """Serialize a value to its TOML literal representation.
 
@@ -115,9 +139,9 @@ def _toml_val(v: Any) -> Optional[str]:
             # Fall back to escaped basic string
             esc = (
                 v.replace("\\", "\\\\")
-                 .replace('"', '\\"')
-                 .replace("\n", "\\n")
-                 .replace("\r", "\\r")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
             )
             return f'"{esc}"'
         esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\t", "\\t")

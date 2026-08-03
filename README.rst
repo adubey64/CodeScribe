@@ -17,8 +17,8 @@ translation, including generation of corresponding C++ source files and
 Fortran-C++ interface layers, but the current codebase also supports
 general code inspection, generation, update, and agentic workflows.
 Codescribe can talk to multiple large language model (LLM) backends via
-hosted APIs, OpenAI-compatible endpoints, or local Transformers models,
-and it supports both prompt-driven and tool-using workflows. This makes
+hosted APIs and OpenAI-compatible endpoints, and it supports both
+prompt-driven and tool-using workflows. This makes
 it useful both for modernizing legacy scientific codes and for broader
 code-generation and maintenance tasks.
 
@@ -32,6 +32,7 @@ code-generation and maintenance tasks.
 
 -  Tutorials:
 
+   -  https://github.com/akashdhruv/ralph-with-poisson
    -  https://anl.box.com/s/zv3zdbphqprdz8rjh1c84xpeqd8yg32u
    -  https://github.com/akashdhruv/codescribe-tutorial.git
 
@@ -57,8 +58,22 @@ code-generation and maintenance tasks.
 -  Custom Prompts: Automatically generate prompts for generative AI to
    assist with the conversion process.
 
--  Language Model Integration: Use OpenAI, Anthropic, ARGO,
-   OpenAI-compatible endpoints, or local Transformers checkpoints.
+-  Language Model Integration: Use OpenAI, Anthropic, or
+   OpenAI-compatible endpoints.
+
+-  Multi-Agent Workflows: A developer authors task files that coordinate
+   multiple specialized subagents. For example, a Fortran-to-C++
+   pipeline may span three phases:
+
+   -  **Planning** — an indexing tool scans the codebase and a Neural
+      Inspection subagent identifies files with similar code patterns,
+      producing TOML chat-completion templates as context.
+   -  **Execution** — a Draft Generation tool and Neural Translation
+      subagent consume those templates to produce C++ source files and
+      Fortran-C interface layers.
+   -  **Testing** — a Testing subagent validates the output inside a
+      Ralph Loop harness; failures cycle back to execution while
+      successes yield the final C++ codebase.
 
    |fig2|
 
@@ -88,16 +103,14 @@ iteratively converting the code, is a more practical approach.
 Codescribe supports this process by automating the creation of these
 interfaces and assisting with generative AI to improve efficiency and
 accuracy, ensuring that performance and functionality are maintained
-throughout the conversion. Additionally, Codescribe facilitates code
-generation and updates, enabling users to create new applications or
-modify existing files seamlessly.
+throughout the conversion.
 
 **************
  Installation
 **************
 
-At present, we recommend installing Codescribe in a virtual
-environment:
+Codescribe uses ``pyproject.toml`` to declare its build system and
+dependencies. We recommend installing in a virtual environment:
 
 .. code:: bash
 
@@ -105,14 +118,41 @@ environment:
    source env/bin/activate
    pip install --upgrade pip
 
-And install Codescribe using ``pip`` in editable mode:
+Install Codescribe and its core dependencies using ``pip`` in editable
+mode:
 
 .. code:: bash
 
    pip install -e .
 
-Editable mode enables testing of features/updates directly from the
-source code and is an effective method for debugging.
+
+***************
+ Quick Start
+***************
+
+Set your API key and run a one-shot agent task:
+
+.. code:: bash
+
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   code-scribe agent "Write a hello world Python script to hello.py" \
+       -m anthropic-claude-sonnet-4-6 --verbose
+
+The agent uses the ``write`` tool to create ``hello.py`` and emits a
+``<final_answer>`` when done. With ``--verbose`` you see each tool call
+and token usage as it runs.
+
+To run a multi-session bounded loop over a task file:
+
+.. code:: bash
+
+   code-scribe loop task.toml -m anthropic-claude-sonnet-4-6 --verbose
+
+See `docs/loop.md <docs/loop.md>`__ for the task file format and
+bounded-tool policy.
+
+If you only need the bounded loop and not the rest of Codescribe's
+tooling, see `CSLoop`_ below for a minimalist standalone CLI.
 
 *******
  Usage
@@ -179,11 +219,10 @@ Following is a brief overview of different commands:
    saved with a ``.scribe`` extension and include prompts tailored to
    each statement in the original source code.
 
-#. ``code-scribe translate <filelist> -m <model_name_or_path> -p
+#. ``code-scribe translate <filelist> -m <model_name> -p
    <seed_prompt.toml>``: Perform AI-assisted translation using a prompt
-   template and a selected model backend. The model may be a local
-   Hugging Face / Transformers checkpoint path or a prefixed hosted
-   backend such as ``openai-gpt-4o``. The ``<prompt.toml>`` file is a
+   template and a selected model backend. The model should use a
+   supported prefix such as ``openai-gpt-4o``. The ``<prompt.toml>`` file is a
    chat template that guides translation using the source and draft
    ``.scribe`` files.
 
@@ -217,67 +256,64 @@ Following is a brief overview of different commands:
    an external chat interface.
 
 #. ``code-scribe inspect <filelist> -q <query_prompt> -m
-   <model_name_or_path>``: Perform a query on a set of source files
+   <model_name>``: Perform a query on a set of source files
    using a single prompt. This is useful for navigating and
    understanding the source code.
 
-#. ``code-scribe generate <seed_prompt> -m <model_name_or_path>``:
+#. ``code-scribe generate <seed_prompt> -m <model_name>``:
    Generate new source files or applications from a prompt file.
 
 #. ``code-scribe generate "<natural_language_prompt>" -m
-   <model_name_or_path> -r <reference_file1> -r <reference_file2>``:
+   <model_name> -r <reference_file1> -r <reference_file2>``:
    Generate new source files or applications from a natural-language
    prompt while using existing files as read-only references.
 
 #. ``code-scribe update <filelist> -p <seed_prompt.toml> -m
-   <model_name_or_path>``: Modify or extend existing source files using
+   <model_name>``: Modify or extend existing source files using
    a seed prompt file.
 
 #. ``code-scribe update <filelist> -q "<natural_language_prompt>" -r
-   <reference_file1> -r <reference_file2> -m <model_name_or_path>``:
+   <reference_file1> -r <reference_file2> -m <model_name>``:
    Update files from a natural-language prompt while using additional
    files as read-only references.
 
-#. ``code-scribe agent "<task>" -m <model_name_or_path>``: Run a
+#. ``code-scribe agent "<task>" -m <model_name>``: Run a
    standalone coding agent that can iteratively use ``read``, ``glob``,
    ``bash``, ``edit``, and ``write`` tools until it reaches a final
-   answer. When a backend supports native tool calling, Codescribe uses
-   that directly; otherwise it falls back to a text protocol using
-   ``<tool_call>`` and ``<final_answer>`` blocks.
+   answer.
 
    Key flags:
 
    -  ``--verbose`` / ``-v``: stream per-iteration token usage and tool
       calls to stdout.
    -  ``--log`` / ``--log-path PATH``: write TOML diagnostics to disk.
+   -  ``--reason``: enable adaptive thinking (Anthropic models only;
+      silently ignored for all other backends).
 
-#. ``code-scribe loop <task_file> -m <model_name_or_path>``: Run a
+#. ``code-scribe loop <task_file> -m <model_name>``: Run a
    repeated bounded loop in which each session starts fresh, reads the
-   task file, performs exactly one important pending task, writes a
-   concise report, and exits. Loop status is written under
-   ``.codescribe/loop/``.
+   task file, attempts to complete as much remaining work as possible in
+   that session, and then runs review when needed. Loop status is
+   written under ``.codescribe/loop/``.
 
    Key flags:
 
    -  ``--workdir DIR``: root directory the agent is bounded to.
-   -  ``--agent-loops`` / ``-nloop N``: number of execution → review
+   -  ``--agent-loops`` / ``-nloop N``: number of author → review
       cycles (default 5).
    -  ``--agent-iterations`` / ``-niter N``: tool-call budget per cycle
-      (default 12).
-
-For further detail on agent and loop internals see the in-tree docs:
-
--  ``docs/agent.md`` — agent architecture and bounded-mode policy
--  ``docs/loop.md`` — loop mode internals and on-disk artifacts
--  ``docs/tools.md`` — tool implementations (read/glob/bash/edit/write)
--  ``docs/models.md`` — model backends and environment variables
+      (default 30).
+   -  ``--reason``: enable adaptive thinking (Anthropic models only;
+      silently ignored for all other backends).
 
 ***************
  Agentic Modes
 ***************
 
 Codescribe includes two agent-oriented workflows in addition to the
-prompt-driven translation and generation commands.
+prompt-driven translation and generation commands. For deeper detail see
+the in-tree docs: ``docs/agent.md``, ``docs/loop.md``,
+``docs/tools.md``, ``docs/models.md``, and ``docs/cmd.md``.
 
 #. **Agent mode** runs a single tool-using agent session on a task.
    The available tools are:
@@ -296,19 +332,29 @@ prompt-driven translation and generation commands.
 
 When verbose mode is enabled, Codescribe prints per-iteration
 information including iteration number, token usage, tool calls, and a
-short status summary for each tool result. In loop mode it also writes:
+short status summary for each tool result. In loop mode it also writes
+on-disk artifacts under ``.codescribe/loop/`` for inspection and
+crash-resume:
 
--  ``.codescribe/loop/status.json``
--  ``.codescribe/loop/report.md``
+-  ``run.toml`` — run metadata (model, limits, run_id)
+-  ``state.toml`` — mutable loop state (loop index, current phase)
+-  ``author.toml`` — event log for the most recent author phase
+-  ``review_output.toml`` — review agent's structured output
+-  ``review.toml`` — event log for the review agent
 
 A typical verbose loop session looks like this:
 
 .. code:: text
 
-   ▶  loop 1
+   ▶  loop 1 [author]
      iter 1
-       usage  in 1,353  out 81  total 1,434
-       ▸ read   prompt.md                                                 21 lines
+       │ Let me start by reading the task file and understanding the current state.
+       usage  in 2,517  out 162  total 2,679
+       ▸ read   specification.toml           # path: /path/to/specification.toml
+       ▸ bash   find . -type f ...           bash exit_code=0
+     iter 2
+       usage  in 4,481  out 69  total 4,550
+       ▸ read   PLAN.md                      # path: /path/to/PLAN.md
 
 Sessions stop when the agent emits a final answer or when the configured
 iteration limit is reached. If the limit is reached first, the run ends
@@ -337,12 +383,6 @@ with a message similar to:
 
       export OPENAI_API_KEY="your_openai_api_key_here"
 
-   And install the OpenAI library:
-
-   .. code:: bash
-
-      pip install openai
-
 #. **Anthropic Models**: Codescribe supports Anthropic's Claude models
    (such as ``claude-opus-4-8``, ``claude-sonnet-4-6``,
    ``claude-haiku-4-5``, etc.) via the Anthropic API. The
@@ -357,12 +397,6 @@ with a message similar to:
    .. code:: bash
 
       export ANTHROPIC_API_KEY="your_anthropic_api_key_here"
-
-   And install the Anthropic library:
-
-   .. code:: bash
-
-      pip install anthropic
 
    Optionally set ``ANTHROPIC_BASE_URL`` to redirect requests to a
    compatible proxy or private endpoint.
@@ -399,54 +433,6 @@ with a message similar to:
    **Note**: For ALCF inference endpoints, set ``OPENAI_COMP_PROVIDER``
    to a value containing ``alcf`` (e.g., ``alcf-inference``).
 
-#. **ARGO Models**: Codescribe also supports integration with Argonne's
-   ARGO models, such as ``argo-gpt4o``. The ``argo-`` prefix is
-   required. These models are accessible on the Argonne network by
-   setting ``ARGO_USER`` and ``ARGO_API_ENDPOINT``:
-
-   .. code:: bash
-
-      ▶ code-scribe translate <filelist> -m argo-gpt4o -p <seed_prompt.toml>
-
-   .. code:: bash
-
-      export ARGO_USER="your_argo_username"
-      export ARGO_API_ENDPOINT="argo_api_endpoint"
-
-   ARGO models are recommended for users with access to the Argonne
-   network.
-
-#. **Hugging Face Transformers (TFModel)**: You can use a local Hugging
-   Face / Transformers checkpoint by passing its path as the model
-   argument. Codescribe supports this through the ``TFModel`` backend.
-
-   To use a Hugging Face model, first install the necessary libraries:
-
-   .. code:: bash
-
-      pip install transformers torch
-
-   Then specify the path to the pre-trained model using the ``-m`` flag.
-   For example, to use a GPT-2 model:
-
-   .. code:: bash
-
-      ▶ code-scribe translate <filelist> -m <path_to_model> -p <seed_prompt.toml>
-
-   You can download a model from the Hugging Face model hub by visiting
-   https://huggingface.co/models.
-
-#. **Saving Custom Prompts**: Instead of selecting a model and running
-   a command immediately, you can save the generated prompts for later
-   use. Use the ``--save-prompts`` flag to store prompts in JSON format,
-   which is useful when copying them into an external chat tool.
-
-   .. code:: bash
-
-      ▶ code-scribe translate <filelist> -p <seed_prompt.toml> --save-prompts
-
-   For ``inspect``, the saved prompt is written to ``scribe.json``. For
-   ``translate``, prompt files are generated per source file.
 
 Please see the source file ``codescribe/lib/_llm.py`` for full backend
 implementation details.
@@ -460,25 +446,12 @@ backend you select.
 
 -  ``CODESCRIBE_MODEL``: default model name used when ``-m`` is omitted.
 -  ``CODESCRIBE_MAX_TOKENS``: maximum output tokens per model reply
-   (default: 24576).
+   (default: 32768).
 -  ``OPENAI_API_KEY`` for ``openai-*`` models
 -  ``ANTHROPIC_API_KEY`` for ``anthropic-*`` models
 -  ``ANTHROPIC_BASE_URL`` (optional) for ``anthropic-*`` proxy endpoints
--  ``ARGO_USER`` and ``ARGO_API_ENDPOINT`` for ``argo-*`` models
 -  ``OPENAI_COMP_BASEURL``, ``OPENAI_COMP_PROVIDER``, and
    ``OPENAI_COMP_APIKEY`` for ``oaic-*`` models
--  ``CODESCRIBE_ARCHIVE``: directory path for saving LLM interaction
-   transcripts for downstream analysis or debugging
-
-To archive interactions with LLMs, set ``CODESCRIBE_ARCHIVE`` to a
-directory path where the interactions will be stored:
-
-.. code:: bash
-
-   export CODESCRIBE_ARCHIVE="/path/to/archive/directory"
-
-Archived conversations are written as TOML files under a dated folder
-structure.
 
 *************************************
  Bounded Loop Diagnostics and Caveats
@@ -516,6 +489,65 @@ These diagnostics are expected and useful: they show exactly how the
 bounded tool layer constrains an agent session. See ``docs/loop.md`` for
 the full bounded-mode policy and how to configure ``--workdir``.
 
+*********
+ CS-Loop
+*********
+
+`CS-Loop <https://github.com/Lab-Notebooks/CS-Loop>`__ is a standalone
+Rust port of ``code-scribe loop``, distributed as a single compiled
+binary. It is a minimalist alternative for projects that only want the
+bounded author/review loop and do not need Codescribe's broader
+orchestration — agent mode, translation, generation, and inspection.
+
+.. code:: bash
+
+   cargo install --git https://github.com/Lab-Notebooks/CS-Loop
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   csloop task.toml -m claude-sonnet-4-6 --verbose
+
+CS-Loop speaks to Anthropic models only and mirrors the same task-file
+format, ``--agent-loops``/``--agent-iterations`` bounds, and
+``--verbose``/``--log`` diagnostics as ``code-scribe loop``, writing its
+artifacts under ``.csloop/loop/`` instead of ``.codescribe/loop/``. See
+the `CSLoop README <https://github.com/Lab-Notebooks/csloop#readme>`__
+for the full flag reference and install options (including installing
+over SSH).
+
+****************
+ Code of Conduct
+****************
+
+We are committed to fostering a welcoming and respectful community.
+All participants in this project are expected to:
+
+-  Be respectful and considerate of others.
+-  Use inclusive language and avoid discriminatory or harassing behavior.
+-  Accept constructive feedback graciously.
+-  Focus on what is best for the community and the project.
+
+Unacceptable behavior should be reported to the project maintainers.
+Maintainers have the right to remove, edit, or reject any contributions
+that do not align with these standards.
+
+***************
+ Contributing
+***************
+
+Contributions are welcome and appreciated. There are two main ways to
+contribute:
+
+#. **File an issue**: Report a bug, request a feature, or ask a
+   question by opening an issue on the project's GitHub page.
+
+#. **Create a pull request**: Pick up an item from
+   `docs/TODO.md <docs/TODO.md>`__, implement it, and open a pull
+   request. Please keep pull requests focused on a single task and
+   include a brief description of what was changed and why.
+
+Before submitting a pull request, make sure your changes pass any
+existing tests and follow the code style conventions used in the
+project (``black`` for Python formatting).
+
 **********
  Citation
 **********
@@ -524,13 +556,13 @@ the full bounded-mode policy and how to configure ``--workdir``.
 
    @software{akash_dhruv_2024_13879406,
    author       = {Akash Dhruv},
-   title        = {akashdhruv/Codescribe: 2026.02},
+   title        = {akashdhruv/CodeScribe: 2026.02},
    month        = feb,
    year         = 2026,
    publisher    = {Zenodo},
    version      = {2026.02},
    doi          = {10.5281/zenodo.18738066},
-   url          = {https://github.com/akashdhruv/Codescribe}
+   url          = {https://github.com/Lab-Notebooks/CodeScribe}
    }
 
 .. code:: latex
@@ -549,7 +581,7 @@ the full bounded-mode policy and how to configure ``--workdir``.
    :target: https://github.com/psf/black
 
 .. |fig1| image:: ./media/workflow.png
-   :width: 600px
+   :width: 650px
 
-.. |fig2| image:: ./media/engine.png
-   :width: 600px
+.. |fig2| image:: ./media/agent.png
+   :width: 850px

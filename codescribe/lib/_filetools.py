@@ -1,3 +1,7 @@
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
+
 import re
 import os
 import toml
@@ -11,6 +15,22 @@ from typing import List, Dict, Set, Any
 from codescribe import lib
 
 from ._logging import write_archive_toml
+
+__all__ = [
+    "load_chat_template",
+    "format_seed_prompt",
+    "format_text_block",
+    "extract_fortran_info",
+    "create_scribe_yaml",
+    "load_scribe_yaml",
+    "create_file_indexes",
+    "filter_file_indexes",
+    "isolate_scalar_functions",
+    "query_construct",
+    "extract_fortran_meta",
+    "annotate_fortran_file",
+    "create_src_mapping",
+]
 
 
 def load_chat_template(filepath: Path, *, return_meta: bool = False):

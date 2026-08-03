@@ -1,0 +1,2 @@
+- IGNORE: *.dev/, *.dev
+- CARD: AGENT.json

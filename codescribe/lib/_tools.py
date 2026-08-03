@@ -1,3 +1,7 @@
+# Copyright (c) 2026 UChicago Argonne LLC
+# SPDX-License-Identifier: Apache-2.0
+# Full license and notices: see LICENSE and NOTICE in the repo root.
+
 """Tool implementations for the standalone baremetal coding agent.
 
 This module is intentionally separate from `_agent.py` to keep the core agent loop
@@ -43,6 +47,38 @@ class AgentTool:
         self.parameters = parameters
         self.enabled = enabled
 
+    @staticmethod
+    def resolve_within_root(root: Path, target: str) -> Path:
+        root = root.resolve()
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = (root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise ValueError(f"Path escapes working directory: {target}")
+
+        return candidate
+
+    @staticmethod
+    def is_git_internal(path: Any) -> bool:
+        """True if any path component is '.git' (repo metadata/hooks/config)."""
+        return ".git" in Path(path).parts
+
+    @staticmethod
+    def is_protected_path(path: Any, protected_paths: Optional[set]) -> bool:
+        """True if `path` resolves to one of `protected_paths` (e.g. the task file)."""
+        if not protected_paths:
+            return False
+        try:
+            resolved = Path(path).resolve()
+        except Exception:
+            return False
+        return resolved in protected_paths
+
     def run(self, args: Dict[str, Any]) -> str:
         raise NotImplementedError(f"{self.name}.run() is not implemented")
 
@@ -61,22 +97,6 @@ class AgentTool:
             f"- {self.name}: {self.description}\n"
             f"  JSON schema: {json.dumps(self.parameters, ensure_ascii=False)}"
         )
-
-
-def _resolve_within_root(root: Path, target: str) -> Path:
-    root = root.resolve()
-    candidate = Path(target)
-    if not candidate.is_absolute():
-        candidate = (root / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        raise ValueError(f"Path escapes working directory: {target}")
-
-    return candidate
 
 
 class ReadTool(AgentTool):
@@ -130,7 +150,7 @@ class ReadTool(AgentTool):
 
         if self.root is not None:
             try:
-                path = str(_resolve_within_root(self.root, path))
+                path = str(self.resolve_within_root(self.root, path))
             except Exception as exc:
                 return f"Error: {exc}"
 
@@ -218,7 +238,7 @@ class GlobTool(AgentTool):
             base = self.root
             if root_arg:
                 try:
-                    base = _resolve_within_root(self.root, root_arg)
+                    base = self.resolve_within_root(self.root, root_arg)
                 except Exception as exc:
                     return f"Error: {exc}"
         else:
@@ -236,7 +256,7 @@ class GlobTool(AgentTool):
             try:
                 if self.root is not None:
                     # Ensure bounded matches can't escape.
-                    p = _resolve_within_root(self.root, str(p))
+                    p = self.resolve_within_root(self.root, str(p))
                 else:
                     p = p.resolve()
             except Exception:
@@ -260,7 +280,7 @@ class GlobTool(AgentTool):
 
 
 class BashTool(AgentTool):
-    _BLOCKED_CHARS = set("|&;><`$")
+    _BLOCKED_CHARS = set("|&;><`$\n\r")
     _DEFAULT_ALLOWED = {
         "ls",
         "pwd",
@@ -280,10 +300,12 @@ class BashTool(AgentTool):
         cwd: Optional[Path] = None,
         bounded: bool = False,
         allowed_commands: Optional[set] = None,
+        protected_paths: Optional[set] = None,
     ) -> None:
         self.cwd = Path(cwd).resolve() if cwd is not None else None
         self.bounded = bounded
         self.allowed_commands = set(allowed_commands or self._DEFAULT_ALLOWED)
+        self.protected_paths = set(protected_paths or set())
 
         desc = "Execute a bash command in the current working directory."
         if cwd is not None:
@@ -296,6 +318,28 @@ class BashTool(AgentTool):
             desc += " Potentially-dangerous shell syntax is blocked (pipes, redirects, $(), etc)."
             allowed = ", ".join(sorted(self.allowed_commands))
             desc += f" Allowed commands: {allowed}."
+
+            caveats = []
+            if any(cmd in self.allowed_commands for cmd in ("find", "bfs", "gfind")):
+                caveats.append(
+                    "find: -exec/-execdir/-ok/-okdir are rejected; use find only to locate paths."
+                )
+            if "rg" in self.allowed_commands:
+                caveats.append(
+                    "rg: --pre/--pre-glob are rejected."
+                )
+            if "sed" in self.allowed_commands:
+                caveats.append(
+                    "sed: runs with --sandbox enforced in bounded mode."
+                )
+            if "git" in self.allowed_commands:
+                caveats.append(
+                    "git: config subcommand and -c/-p/--paginate/--exec-path/--git-dir/"
+                    "--work-tree/--namespace/--upload-pack/--receive-pack/--upload-archive "
+                    "flags are rejected; ext:: and fd:: transport URLs are rejected."
+                )
+            if caveats:
+                desc += " " + " ".join(caveats)
 
         super().__init__(
             name="bash",
@@ -319,7 +363,7 @@ class BashTool(AgentTool):
             enabled=True,
         )
 
-    def _is_safe(self, command: str) -> Optional[str]:
+    def validate_command(self, command: str) -> Optional[str]:
         if not self.bounded:
             return None
 
@@ -339,7 +383,88 @@ class BashTool(AgentTool):
         if exe not in self.allowed_commands:
             return f"command not allowed: {exe!r}"
 
+        if exe in {"find", "bfs", "gfind"}:
+            bad = next(
+                (
+                    arg
+                    for arg in parts[1:]
+                    if arg in {"-exec", "-execdir", "-ok", "-okdir", "-delete"}
+                ),
+                None,
+            )
+            if bad is not None:
+                return f"disallowed {exe} flag {bad!r}: spawns an arbitrary program per match or deletes files"
+
+        if exe == "rg":
+            bad = next(
+                (
+                    arg
+                    for arg in parts[1:]
+                    if arg in {"--pre", "--pre-glob"}
+                    or arg.startswith("--pre=")
+                    or arg.startswith("--pre-glob=")
+                ),
+                None,
+            )
+            if bad is not None:
+                return "disallowed rg flag --pre/--pre-glob: spawns an arbitrary preprocessor program"
+
+        if exe == "git":
+            if "config" in parts[1:]:
+                return (
+                    "disallowed git subcommand 'config': can set core.pager/"
+                    "core.fsmonitor/alias.*/etc, turning a later plain git "
+                    "invocation into arbitrary command execution"
+                )
+            git_flag_prefixes = (
+                "--exec-path",
+                "--git-dir",
+                "--work-tree",
+                "--namespace",
+                "--upload-pack",
+                "--receive-pack",
+                "--upload-archive",
+            )
+            bad = next(
+                (
+                    arg
+                    for arg in parts[1:]
+                    if arg in {"-c", "-p", "--paginate"}
+                    or arg.startswith(git_flag_prefixes)
+                ),
+                None,
+            )
+            if bad is not None:
+                return f"disallowed git flag {bad!r}: can override config/paths or force hook execution"
+            bad = next(
+                (arg for arg in parts[1:] if "ext::" in arg or "fd::" in arg),
+                None,
+            )
+            if bad is not None:
+                return f"disallowed git argument {bad!r}: ext:: and fd:: transports spawn an arbitrary helper program"
+
+        if self.cwd is not None:
+            for arg in parts[1:]:
+                if arg.startswith("-"):
+                    continue
+                try:
+                    resolved = self.resolve_within_root(self.cwd, arg)
+                except Exception:
+                    return f"argument escapes working directory: {arg!r}"
+                if resolved in self.protected_paths:
+                    return f"argument targets a protected path: {arg!r}"
+
         return None
+
+    def harden_command(self, command: str) -> str:
+        try:
+            parts = shlex.split(command)
+        except Exception:
+            return command
+        if not parts or parts[0] != "sed" or "--sandbox" in parts:
+            return command
+        parts.insert(1, "--sandbox")
+        return shlex.join(parts)
 
     def run(self, args: Dict[str, Any]) -> str:
         command = args.get("command")
@@ -348,9 +473,12 @@ class BashTool(AgentTool):
         if not command:
             return "Error: missing required argument 'command'"
 
-        err = self._is_safe(command)
+        err = self.validate_command(command)
         if err:
             return f"Error: {err}"
+
+        if self.bounded:
+            command = self.harden_command(command)
 
         try:
             proc = subprocess.run(
@@ -375,7 +503,9 @@ class BashTool(AgentTool):
 
 
 class EditTool(AgentTool):
-    def __init__(self, root: Optional[Path] = None) -> None:
+    def __init__(
+        self, root: Optional[Path] = None, protected_paths: Optional[set] = None
+    ) -> None:
         desc = "Edit a file using exact text replacements (all oldText must match exactly once)."
         if root is not None:
             desc += " Access is restricted to the working directory tree."
@@ -410,9 +540,10 @@ class EditTool(AgentTool):
             enabled=True,
         )
         self.root = Path(root).resolve() if root is not None else None
+        self.protected_paths = set(protected_paths or set())
 
     @staticmethod
-    def _snippet(text: str, start: int, end: int, context: int = 80) -> str:
+    def snippet(text: str, start: int, end: int, context: int = 80) -> str:
         """Return a compact snippet around [start:end]."""
         left = max(0, start - context)
         right = min(len(text), end + context)
@@ -431,9 +562,14 @@ class EditTool(AgentTool):
 
         if self.root is not None:
             try:
-                path = str(_resolve_within_root(self.root, path))
+                path = str(self.resolve_within_root(self.root, path))
             except Exception as exc:
                 return f"Error: {exc}"
+
+        if self.is_git_internal(path):
+            return "Error: editing files under .git/ is not allowed"
+        if self.is_protected_path(path, self.protected_paths):
+            return "Error: editing this file is not allowed"
 
         if not os.path.exists(path):
             return f"Error: file not found: {path}"
@@ -465,7 +601,7 @@ class EditTool(AgentTool):
                     "match_count": count,
                     "old_len": len(old),
                     "new_len": len(new),
-                    "before_snippet": self._snippet(content_before, start, end),
+                    "before_snippet": self.snippet(content_before, start, end),
                     "oldText": old,
                     "newText": new,
                 }
@@ -487,7 +623,7 @@ class EditTool(AgentTool):
             new = r["newText"]
             pos = content_after.find(new)
             if pos >= 0:
-                r["after_snippet"] = self._snippet(content_after, pos, pos + len(new))
+                r["after_snippet"] = self.snippet(content_after, pos, pos + len(new))
             else:
                 r["after_snippet"] = "(newText not found after write)"
 
@@ -511,7 +647,9 @@ class EditTool(AgentTool):
 
 
 class WriteTool(AgentTool):
-    def __init__(self, root: Optional[Path] = None) -> None:
+    def __init__(
+        self, root: Optional[Path] = None, protected_paths: Optional[set] = None
+    ) -> None:
         desc = "Write a file (create or overwrite)."
         if root is not None:
             desc += " Access is restricted to the working directory tree."
@@ -533,6 +671,7 @@ class WriteTool(AgentTool):
             enabled=True,
         )
         self.root = Path(root).resolve() if root is not None else None
+        self.protected_paths = set(protected_paths or set())
 
     def run(self, args: Dict[str, Any]) -> str:
         path = args.get("path")
@@ -545,9 +684,14 @@ class WriteTool(AgentTool):
 
         if self.root is not None:
             try:
-                path = str(_resolve_within_root(self.root, path))
+                path = str(self.resolve_within_root(self.root, path))
             except Exception as exc:
                 return f"Error: {exc}"
+
+        if self.is_git_internal(path):
+            return "Error: writing files under .git/ is not allowed"
+        if self.is_protected_path(path, self.protected_paths):
+            return "Error: writing this file is not allowed"
 
         try:
             parent = os.path.dirname(path)
@@ -560,10 +704,16 @@ class WriteTool(AgentTool):
             return f"Error: {exc}"
 
 
-def make_tools(root: Path, bash_allow: Optional[set] = None) -> List[AgentTool]:
+def make_tools(
+    root: Path,
+    bash_allow: Optional[set] = None,
+    protected_paths: Optional[set] = None,
+) -> List[AgentTool]:
     """Create the default bounded toolset (read/glob/bash/edit/write).
 
     `bash_allow` extends the default bash allowlist with additional command names.
+    `protected_paths` are resolved paths (e.g. the task file) that write/edit/bash
+    may never target, even though they live inside `root`.
     """
     allowed = set(BashTool._DEFAULT_ALLOWED)
     if bash_allow:
@@ -572,14 +722,21 @@ def make_tools(root: Path, bash_allow: Optional[set] = None) -> List[AgentTool]:
     return [
         ReadTool(root=root),
         GlobTool(root=root),
-        BashTool(cwd=root, bounded=True, allowed_commands=allowed),
-        EditTool(root=root),
-        WriteTool(root=root),
+        BashTool(
+            cwd=root,
+            bounded=True,
+            allowed_commands=allowed,
+            protected_paths=protected_paths,
+        ),
+        EditTool(root=root, protected_paths=protected_paths),
+        WriteTool(root=root, protected_paths=protected_paths),
     ]
 
 
 def make_readonly_tools(
-    root: Path, bash_allow: Optional[set] = None
+    root: Path,
+    bash_allow: Optional[set] = None,
+    protected_paths: Optional[set] = None,
 ) -> List[AgentTool]:
     """Create a bounded read-only toolset (read/glob/bash only).
 
@@ -592,7 +749,12 @@ def make_readonly_tools(
     return [
         ReadTool(root=root),
         GlobTool(root=root),
-        BashTool(cwd=root, bounded=True, allowed_commands=allowed),
+        BashTool(
+            cwd=root,
+            bounded=True,
+            allowed_commands=allowed,
+            protected_paths=protected_paths,
+        ),
     ]
 
 
